@@ -88,6 +88,9 @@ export function App() {
   const [health, setHealth] = useState<HealthInfo | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
+  // 意図的な切り替え中フラグ（onDisconnected 抑制用）
+  const switchingRef = useRef(false)
+
   // ──────────────────────────────────────────────
   // ポーリング
   // ──────────────────────────────────────────────
@@ -173,9 +176,14 @@ export function App() {
   // ストリーム切り替え
   // ──────────────────────────────────────────────
   const viewSession = useCallback((sid: string) => {
+    switchingRef.current = true
     setViewingSession(sid)
     setWsUrl(`/api/ws/stream/${sid}`)
     setError(null)
+    // 次の描画サイクルで旧プレイヤーのアンマウントが完了するのを待つ
+    requestAnimationFrame(() => {
+      switchingRef.current = false
+    })
   }, [])
 
   // ──────────────────────────────────────────────
@@ -282,7 +290,7 @@ export function App() {
           aspectRatio,
           width: '100%',
           position: 'relative',
-        }}>
+        }} className="player-container">
           <H264Player
             key={viewingSession}
             wsUrl={wsUrl}
@@ -290,8 +298,16 @@ export function App() {
             maxHeight="70vh"
             fps={5}
             debug={true}
-            onDisconnected={() => setError('接続が切断されました')}
-            onError={(err) => setError(err)}
+            onDisconnected={() => {
+              if (!switchingRef.current) {
+                setError('接続が切断されました')
+              }
+            }}
+            onError={(err) => {
+              if (!switchingRef.current) {
+                setError(err)
+              }
+            }}
           />
         </div>
       ) : (

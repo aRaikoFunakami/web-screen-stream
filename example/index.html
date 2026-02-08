@@ -7,6 +7,9 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #eee; }
+    /* H264Player のキャンバスがキーフレーム到着前に緑になるのを防ぐ */
+    .player-container canvas,
+    .player-container video { background: #000 !important; }
   </style>
 </head>
 <body>
