@@ -26,3 +26,8 @@ packages = ["src/web_screen_stream"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+]
