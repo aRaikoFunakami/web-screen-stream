@@ -1,9 +1,11 @@
 """FastAPI application for Step 1 standalone server.
 
 WebSocket エンドポイント + REST API でブラウザ画面をストリーミング配信する。
+マルチセッション対応: セッションごとに独立した Xvfb を動的起動する。
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -12,21 +14,40 @@ from pydantic import BaseModel
 
 from web_screen_stream.config import StreamConfig
 from web_screen_stream.session import SessionManager
-from web_screen_stream.xvfb import check_display
+from web_screen_stream.xvfb import XvfbManager, check_display
 
 logger = logging.getLogger(__name__)
 
-# SessionManager のシングルトン
-session_manager = SessionManager()
+# XvfbManager / SessionManager のシングルトン
+# XVFB_STATIC=1 の場合は XvfbManager を使わず従来のグローバル Xvfb を使用
+xvfb_manager: XvfbManager | None = None
+session_manager: SessionManager  # lifespan で初期化
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """アプリケーションのライフサイクル管理."""
+    global xvfb_manager, session_manager
+
+    static_mode = os.environ.get("XVFB_STATIC", "0") == "1"
+
+    if static_mode:
+        logger.info("Starting in static Xvfb mode (XVFB_STATIC=1)")
+        xvfb_manager = None
+    else:
+        max_displays = int(os.environ.get("MAX_SESSIONS", "5"))
+        logger.info(
+            "Starting in dynamic Xvfb mode (max_displays=%d)", max_displays
+        )
+        xvfb_manager = XvfbManager(max_displays=max_displays)
+
+    session_manager = SessionManager(xvfb_manager=xvfb_manager)
     logger.info("web-screen-stream server starting")
     yield
     logger.info("web-screen-stream server shutting down")
     await session_manager.stop_all()
+    if xvfb_manager:
+        await xvfb_manager.release_all()
 
 
 app = FastAPI(
@@ -45,13 +66,23 @@ app = FastAPI(
 @app.get("/api/healthz")
 async def healthz() -> dict:
     """ヘルスチェック."""
-    display_ok = check_display()
-    sessions = session_manager.list_sessions()
-    return {
-        "status": "healthy" if display_ok else "degraded",
-        "display": display_ok,
-        "active_sessions": len(sessions),
-    }
+    if xvfb_manager:
+        # 動的 Xvfb モード
+        return {
+            "status": "healthy",
+            "active_sessions": xvfb_manager.active_count,
+            "max_sessions": xvfb_manager.max_displays,
+            "available_displays": xvfb_manager.available_count,
+        }
+    else:
+        # 静的 Xvfb モード（XVFB_STATIC=1）
+        display_ok = check_display()
+        sessions = session_manager.list_sessions()
+        return {
+            "status": "healthy" if display_ok else "degraded",
+            "display": display_ok,
+            "active_sessions": len(sessions),
+        }
 
 
 # ============================================================
@@ -115,6 +146,10 @@ async def get_session(session_id: str) -> dict:
         "session_id": session.session_id,
         "status": session.status,
         "subscribers": session.subscriber_count,
+        "url": session.url,
+        "display": session.display,
+        "resolution": session.resolution,
+        "created_at": session.created_at,
     }
 
 
