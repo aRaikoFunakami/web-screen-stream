@@ -65,6 +65,9 @@ class BrowserStreamSession:
         self._gop_bytes: int = 0
         self._gop_has_idr: bool = False
 
+        # 最初の IDR 到着を待つためのイベント
+        self._idr_ready = asyncio.Event()
+
     @property
     def session_id(self) -> str:
         return self._session_id
@@ -148,14 +151,17 @@ class BrowserStreamSession:
 
         Late-join: GOP キャッシュを Queue に先詰めしてから subscribers に登録。
         これにより SPS→PPS→IDR→non-IDR の順序が保証される。
+        GOP キャッシュに IDR がない場合は、最初の IDR が到着するまで
+        non-IDR フレームをスキップする（ブロッキングなし）。
 
         Yields:
             H.264 NAL units (Annex-B 形式)
         """
         async with self._lock:
             # GOP スナップショットを取得
+            has_idr = self._gop_has_idr
             gop_snapshot = (
-                list(self._gop_nals) if self._gop_has_idr else []
+                list(self._gop_nals) if has_idr else []
             )
             qsize = max(DEFAULT_QUEUE_SIZE, len(gop_snapshot) + DEFAULT_QUEUE_SIZE)
             queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=qsize)
@@ -166,17 +172,48 @@ class BrowserStreamSession:
 
             self._subscribers.append(queue)
             logger.info(
-                "Session %s: subscriber added (total=%d, late_join_nals=%d)",
+                "Session %s: subscriber added (total=%d, late_join_nals=%d, has_idr=%s)",
                 self._session_id,
                 len(self._subscribers),
                 len(gop_snapshot),
+                has_idr,
             )
+
+        # IDR が GOP キャッシュになかった場合は、最初の IDR が来るまでスキップ
+        # ただし SPS/PPS は先に送ってデコーダ初期化を助ける。
+        got_idr = has_idr
+        sent_sps = has_idr
+        sent_pps = has_idr
 
         try:
             while True:
                 nal = await queue.get()
                 if nal is _SENTINEL:
                     break
+                if not got_idr:
+                    nal_type = H264UnitExtractor.nal_type(nal)
+                    if nal_type == H264UnitExtractor.NAL_TYPE_SPS:
+                        if not sent_sps:
+                            sent_sps = True
+                            yield nal
+                        continue
+                    if nal_type == H264UnitExtractor.NAL_TYPE_PPS:
+                        if not sent_pps:
+                            sent_pps = True
+                            yield nal
+                        continue
+                    if nal_type == H264UnitExtractor.NAL_TYPE_IDR:
+                        got_idr = True
+                        # IDR の前に SPS/PPS を送る
+                        if not sent_sps and self._last_sps:
+                            sent_sps = True
+                            yield self._last_sps
+                        if not sent_pps and self._last_pps:
+                            sent_pps = True
+                            yield self._last_pps
+                    else:
+                        # non-IDR フレームはスキップ
+                        continue
                 yield nal
         finally:
             async with self._lock:
@@ -222,6 +259,7 @@ class BrowserStreamSession:
             self._gop_nals.append(nal)
             self._gop_bytes += len(nal)
             self._gop_has_idr = True
+            self._idr_ready.set()
             return
 
         if nal_type == H264UnitExtractor.NAL_TYPE_NON_IDR:

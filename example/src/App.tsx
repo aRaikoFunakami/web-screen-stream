@@ -82,6 +82,7 @@ export function App() {
   // 視聴状態
   const [viewingSession, setViewingSession] = useState<string | null>(null)
   const [wsUrl, setWsUrl] = useState<string | null>(null)
+  const [playerReady, setPlayerReady] = useState(false)
 
   // セッション一覧 + ヘルス
   const [sessions, setSessions] = useState<SessionInfo[]>([])
@@ -147,6 +148,7 @@ export function App() {
 
       const data = await resp.json()
       // 作成したセッションを視聴
+      setPlayerReady(false)
       setViewingSession(data.session_id)
       setWsUrl(data.ws_url)
       await fetchSessions()
@@ -177,6 +179,7 @@ export function App() {
   // ──────────────────────────────────────────────
   const viewSession = useCallback((sid: string) => {
     switchingRef.current = true
+    setPlayerReady(false)
     setViewingSession(sid)
     setWsUrl(`/api/ws/stream/${sid}`)
     setError(null)
@@ -291,6 +294,16 @@ export function App() {
           width: '100%',
           position: 'relative',
         }} className="player-container">
+          {/* キーフレーム到着前のローディング表示 */}
+          {!playerReady && (
+            <div style={{
+              position: 'absolute', inset: 0, zIndex: 1,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              background: '#000', color: '#888', fontSize: 14,
+            }}>
+              ⏳ ストリーム接続中...
+            </div>
+          )}
           <H264Player
             key={viewingSession}
             wsUrl={wsUrl}
@@ -298,6 +311,11 @@ export function App() {
             maxHeight="70vh"
             fps={5}
             debug={true}
+            onConnected={() => {
+              // 映像の最初のフレームが来るまで少し待つ
+              // gop_size=10, fps=5 のため最大2秒程度キーフレーム待ちが起きうる
+              setTimeout(() => setPlayerReady(true), 2200)
+            }}
             onDisconnected={() => {
               if (!switchingRef.current) {
                 setError('接続が切断されました')

@@ -60,6 +60,9 @@ class FFmpegSource:
             "-g", str(c.gop_size),
             "-keyint_min", str(c.gop_size),
             "-sc_threshold", "0",
+            # Late-join / セッション切り替え時のデコーダ安定性のため、
+            # キーフレームごとに SPS/PPS を必ず再送する。
+            "-x264-params", "repeat-headers=1",
             "-b:v", c.bitrate,
             "-maxrate", c.maxrate,
             "-bufsize", c.bufsize,
