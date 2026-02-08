@@ -84,7 +84,7 @@ class StreamConfig:
     display: str = ":99"
     width: int = 1280
     height: int = 720
-    framerate: int = 5
+  framerate: int = 15
     bitrate: str = "500k"
     maxrate: str = "800k"
 ```

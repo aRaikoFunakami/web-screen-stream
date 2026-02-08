@@ -309,12 +309,12 @@ export function App() {
             wsUrl={wsUrl}
             fit="contain"
             maxHeight="70vh"
-            fps={5}
+            fps={15}
             debug={true}
             onConnected={() => {
               // 映像の最初のフレームが来るまで少し待つ
-              // gop_size=10, fps=5 のため最大2秒程度キーフレーム待ちが起きうる
-              setTimeout(() => setPlayerReady(true), 2200)
+              // gop_size=10, fps=15 のため最大~0.7秒程度キーフレーム待ちが起きうる
+              setTimeout(() => setPlayerReady(true), 900)
             }}
             onDisconnected={() => {
               if (!switchingRef.current) {

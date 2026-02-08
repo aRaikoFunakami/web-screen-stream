@@ -97,7 +97,7 @@ class CreateSessionRequest(BaseModel):
     url: str | None = None
     width: int = 1280
     height: int = 720
-    framerate: int = 5
+    framerate: int = 15
     bitrate: str = "500k"
 
 
