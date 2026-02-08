@@ -1,0 +1,17 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8200:8200"
+    environment:
+      - DISPLAY_NUM=99
+      - SCREEN_WIDTH=1280
+      - SCREEN_HEIGHT=720
+      - PORT=8200
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
