@@ -15,3 +15,15 @@ services:
         limits:
           memory: 2G
           cpus: '2.0'
+
+  web:
+    build:
+      context: ./example
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - VITE_HTTP_PROXY_TARGET=http://server:8200
+      - VITE_WS_PROXY_TARGET=ws://server:8200
+    depends_on:
+      - server

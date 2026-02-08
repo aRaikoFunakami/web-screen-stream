@@ -7,7 +7,7 @@
  */
 
 import { useState, useCallback, useRef, useEffect } from 'react'
-import { H264Player } from 'react-android-screen'
+import { H264Player } from './H264Player'
 
 // ============================================================
 // 定数

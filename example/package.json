@@ -9,9 +9,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "jmuxer": "^2.0.7",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "react-android-screen": "file:../../screen-stream-capture/packages/react-android-screen"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",
