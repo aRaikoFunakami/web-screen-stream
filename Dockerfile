@@ -38,7 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 WORKDIR /app
 COPY pyproject.toml README.md ./
-RUN uv sync
+RUN uv sync --no-install-project
 
 # === Playwright ブラウザインストール ===
 RUN uv run playwright install chromium
@@ -47,6 +47,9 @@ RUN uv run playwright install chromium
 COPY src/ ./src/
 COPY app/ ./app/
 COPY entrypoint.sh ./
+
+# ソースコード込みで再 sync（パッケージ自体をインストール）
+RUN uv sync
 
 RUN chmod +x entrypoint.sh
 
