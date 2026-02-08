@@ -92,6 +92,11 @@ async def create_session(req: CreateSessionRequest) -> dict:
         }
     except ValueError as e:
         return JSONResponse(status_code=409, content={"error": str(e)})
+    except RuntimeError as e:
+        return JSONResponse(status_code=502, content={"error": str(e)})
+    except Exception as e:
+        logger.exception("Unexpected error creating session %s", req.session_id)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.get("/api/sessions")

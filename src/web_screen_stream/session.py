@@ -349,7 +349,19 @@ class SessionManager:
         page = await browser.new_page(
             viewport={"width": config.width, "height": config.height}
         )
-        await page.goto(url, wait_until="domcontentloaded")
+        try:
+            await page.goto(url, wait_until="domcontentloaded")
+        except Exception as e:
+            logger.error("Failed to navigate to %s: %s", url, e)
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            try:
+                await pw.__aexit__(None, None, None)
+            except Exception:
+                pass
+            raise RuntimeError(f"URL '{url}' を開けませんでした: {e}") from e
 
         self._browsers[session_id] = (browser, page)
         logger.info(
