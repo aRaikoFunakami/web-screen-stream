@@ -6,14 +6,21 @@ FFmpegSource からの H.264 NAL units を複数の WebSocket クライアント
 android-screen-stream の StreamSession/StreamManager と同設計。
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any
 
 from web_screen_stream.config import StreamConfig
 from web_screen_stream.ffmpeg_source import FFmpegSource
 from web_screen_stream.h264_extractor import H264UnitExtractor
+
+if TYPE_CHECKING:
+    from web_screen_stream.xvfb import XvfbManager
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +41,17 @@ class BrowserStreamSession:
     GOP キャッシュにより Late-join クライアントも即座にデコード開始可能。
     """
 
-    def __init__(self, session_id: str, config: StreamConfig):
+    def __init__(
+        self,
+        session_id: str,
+        config: StreamConfig,
+        *,
+        url: str | None = None,
+    ):
         self._session_id = session_id
         self._config = config
+        self._url = url
+        self._created_at = time.time()
         self._ffmpeg = FFmpegSource(config)
         self._subscribers: list[asyncio.Queue[bytes]] = []
         self._lock = asyncio.Lock()
@@ -61,6 +76,26 @@ class BrowserStreamSession:
     @property
     def subscriber_count(self) -> int:
         return len(self._subscribers)
+
+    @property
+    def url(self) -> str | None:
+        """表示中の URL."""
+        return self._url
+
+    @property
+    def display(self) -> str:
+        """このセッションの Xvfb ディスプレイ."""
+        return self._config.display
+
+    @property
+    def created_at(self) -> float:
+        """作成時刻 (Unix timestamp)."""
+        return self._created_at
+
+    @property
+    def resolution(self) -> str:
+        """解像度 (例: '1280x720')."""
+        return f"{self._config.width}x{self._config.height}"
 
     async def start(self) -> None:
         """セッション開始: FFmpeg 起動 + ブロードキャストループ開始."""
@@ -231,12 +266,17 @@ class SessionManager:
     """ブラウザストリーミングセッションの管理.
 
     セッションの作成・停止・取得・一覧を提供する。
-    Step 1 では Playwright ブラウザの起動も行う。
+    XvfbManager を注入するとセッションごとに独立した Xvfb を動的起動する。
+    XvfbManager 未設定の場合は従来通り config.display を使用する。
     """
 
-    def __init__(self):
+    def __init__(self, xvfb_manager: XvfbManager | None = None):
         self._sessions: dict[str, BrowserStreamSession] = {}
-        self._browsers: dict[str, tuple] = {}  # session_id → (browser, page)
+        self._browsers: dict[str, tuple[Any, Any, Any]] = {}
+        # (playwright_instance, browser, page)
+        self._displays: dict[str, str] = {}  # session_id → display
+        self._xvfb = xvfb_manager
+        self._lock = asyncio.Lock()
 
     async def create(
         self,
@@ -246,36 +286,102 @@ class SessionManager:
     ) -> BrowserStreamSession:
         """セッション作成: FFmpeg 起動 + ブロードキャスト開始.
 
+        XvfbManager が設定されている場合:
+          1. xvfb_manager.allocate(width, height) でディスプレイ確保
+          2. config.display をそのディスプレイに設定
+          3. 途中で失敗した場合は確保済みリソースを逆順解放
+
         Args:
             session_id: セッション識別子
             config: ストリーム設定（省略時はデフォルト）
-            url: 開くURL（Step 1 用、Playwright でブラウザ起動）
+            url: 開くURL（Playwright でブラウザ起動）
 
         Returns:
             作成した BrowserStreamSession
 
         Raises:
             ValueError: 既に同じ session_id が存在する場合
+            RuntimeError: Xvfb 起動失敗、ブラウザ起動失敗
         """
-        if session_id in self._sessions:
-            raise ValueError(f"Session {session_id} already exists")
+        async with self._lock:
+            if session_id in self._sessions:
+                raise ValueError(f"Session {session_id} already exists")
 
-        if config is None:
-            config = StreamConfig()
+            if config is None:
+                config = StreamConfig()
 
-        session = BrowserStreamSession(session_id, config)
+            display = None
+            pw = None
+            browser = None
 
-        # Step 1: Playwright でブラウザ起動（url が指定された場合）
-        if url:
-            await self._launch_browser(session_id, config, url)
+            try:
+                # Phase 1: ディスプレイ確保（XvfbManager がある場合）
+                if self._xvfb:
+                    display = await self._xvfb.allocate(config.width, config.height)
+                    config = StreamConfig(
+                        display=display,
+                        width=config.width,
+                        height=config.height,
+                        framerate=config.framerate,
+                        bitrate=config.bitrate,
+                        maxrate=config.maxrate,
+                        bufsize=config.bufsize,
+                        gop_size=config.gop_size,
+                    )
 
-        await session.start()
-        self._sessions[session_id] = session
-        logger.info("Session %s created (url=%s)", session_id, url)
-        return session
+                # Phase 2: ブラウザ起動（url が指定された場合）
+                if url:
+                    pw, browser, page = await self._launch_browser(
+                        session_id, config, url
+                    )
+                    if pw is not None:
+                        self._browsers[session_id] = (pw, browser, page)
+
+                # Phase 3: FFmpeg + ストリーミング開始
+                session = BrowserStreamSession(session_id, config, url=url)
+                await session.start()
+                self._sessions[session_id] = session
+                if display:
+                    self._displays[session_id] = display
+
+                logger.info("Session %s created (url=%s)", session_id, url)
+                return session
+
+            except Exception:
+                # 逆順クリーンアップ
+                if browser:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        logger.exception(
+                            "Cleanup: error closing browser for %s", session_id
+                        )
+                if pw:
+                    try:
+                        await pw.stop()
+                    except Exception:
+                        logger.exception(
+                            "Cleanup: error stopping playwright for %s", session_id
+                        )
+                self._browsers.pop(session_id, None)
+                if display and self._xvfb:
+                    try:
+                        await self._xvfb.release(display)
+                    except Exception:
+                        logger.exception(
+                            "Cleanup: error releasing display %s", display
+                        )
+                raise
 
     async def stop(self, session_id: str) -> None:
         """セッション停止: FFmpeg 停止 + ブラウザ終了 + リソース解放.
+
+        逆順解放:
+          1. session.stop() → FFmpeg 停止 + subscriber 通知
+          2. browser.close() + pw.stop() → Playwright 完全解放
+          3. xvfb_manager.release() → Xvfb + Fluxbox 停止
+
+        各ステップは独立 try/except（1つの失敗で他が止まらない）。
 
         Args:
             session_id: 停止するセッションID
@@ -283,21 +389,44 @@ class SessionManager:
         Raises:
             KeyError: セッションが存在しない場合
         """
-        session = self._sessions.pop(session_id, None)
-        if session is None:
-            raise KeyError(f"Session {session_id} not found")
+        async with self._lock:
+            session = self._sessions.pop(session_id, None)
+            if session is None:
+                raise KeyError(f"Session {session_id} not found")
 
-        await session.stop()
+            browser_info = self._browsers.pop(session_id, None)
+            display = self._displays.pop(session_id, None)
 
-        # ブラウザ終了
-        browser_info = self._browsers.pop(session_id, None)
+        # ロック外で停止（I/O 待ちが長い可能性）
+
+        # 1. FFmpeg + subscriber 停止
+        try:
+            await session.stop()
+        except Exception:
+            logger.exception("Error stopping session %s", session_id)
+
+        # 2. Playwright 解放
         if browser_info:
-            browser, _ = browser_info
+            pw, browser, _page = browser_info
             try:
                 await browser.close()
                 logger.info("Browser closed for session %s", session_id)
             except Exception:
                 logger.exception("Error closing browser for session %s", session_id)
+            try:
+                await pw.stop()
+                logger.info("Playwright stopped for session %s", session_id)
+            except Exception:
+                logger.exception(
+                    "Error stopping playwright for session %s", session_id
+                )
+
+        # 3. Xvfb + Fluxbox 解放
+        if display and self._xvfb:
+            try:
+                await self._xvfb.release(display)
+            except Exception:
+                logger.exception("Error releasing display %s", display)
 
         logger.info("Session %s stopped and removed", session_id)
 
@@ -306,19 +435,25 @@ class SessionManager:
         return self._sessions.get(session_id)
 
     def list_sessions(self) -> list[dict]:
-        """アクティブセッション一覧."""
+        """アクティブセッション一覧（メタデータ付き）."""
         return [
             {
                 "session_id": s.session_id,
                 "status": s.status,
                 "subscribers": s.subscriber_count,
+                "url": s.url,
+                "display": s.display,
+                "resolution": s.resolution,
+                "created_at": s.created_at,
             }
             for s in self._sessions.values()
         ]
 
     async def stop_all(self) -> None:
         """全セッション停止."""
-        session_ids = list(self._sessions.keys())
+        async with self._lock:
+            session_ids = list(self._sessions.keys())
+
         for sid in session_ids:
             try:
                 await self.stop(sid)
@@ -327,15 +462,20 @@ class SessionManager:
 
     async def _launch_browser(
         self, session_id: str, config: StreamConfig, url: str
-    ) -> None:
-        """Playwright Chromium を起動してページを開く."""
+    ) -> tuple[Any, Any, Any]:
+        """Playwright Chromium を起動してページを開く.
+
+        Returns:
+            (playwright_instance, browser, page) のタプル
+            Playwright が利用不可の場合は (None, None, None)
+        """
         try:
             from playwright.async_api import async_playwright
         except ImportError:
             logger.warning("Playwright not available, skipping browser launch")
-            return
+            return (None, None, None)
 
-        pw = await async_playwright().__aenter__()
+        pw = await async_playwright().start()
         browser = await pw.chromium.launch(
             headless=False,
             args=[
@@ -358,12 +498,11 @@ class SessionManager:
             except Exception:
                 pass
             try:
-                await pw.__aexit__(None, None, None)
+                await pw.stop()
             except Exception:
                 pass
             raise RuntimeError(f"URL '{url}' を開けませんでした: {e}") from e
 
-        self._browsers[session_id] = (browser, page)
         logger.info(
             "Browser launched for session %s: %s (%dx%d)",
             session_id,
@@ -371,3 +510,4 @@ class SessionManager:
             config.width,
             config.height,
         )
+        return (pw, browser, page)
