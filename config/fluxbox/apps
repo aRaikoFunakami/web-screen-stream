@@ -1,0 +1,6 @@
+# Fluxbox window rules for web-screen-stream
+# すべてのウィンドウのデコレーション（タイトルバー）を除去
+[app] (class=.*) (name=.*)
+  [Decor]  {NONE}
+  [Layer]  {2}
+[end]

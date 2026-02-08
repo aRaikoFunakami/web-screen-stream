@@ -1,0 +1,20 @@
+! Fluxbox init for web-screen-stream
+! デコレーション（タイトルバー）を無効化し、ツールバーを非表示にする
+
+session.menuFile:       ~/.fluxbox/menu
+session.keyFile:        ~/.fluxbox/keys
+session.configVersion:  13
+
+! ツールバー完全非表示
+session.screen0.toolbar.visible: false
+
+! デフォルトデコレーション: NONE
+session.screen0.defaultDeco: NONE
+
+! ウィンドウフォーカスポリシー
+session.screen0.focusModel: ClickFocus
+
+! タブ無効化（Fluxboxタブ、ブラウザタブではない）
+session.screen0.tabs.usePixmap: false
+session.screen0.maxDisableMove: true
+session.screen0.maxDisableResize: true

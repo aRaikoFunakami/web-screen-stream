@@ -43,6 +43,10 @@ RUN uv sync --no-install-project
 # === Playwright ブラウザインストール ===
 RUN uv run playwright install chromium
 
+# === Fluxbox 設定（タイトルバー除去 + ツールバー非表示） ===
+COPY config/fluxbox/apps /root/.fluxbox/apps
+COPY config/fluxbox/init /root/.fluxbox/init
+
 # === ソースコード ===
 COPY src/ ./src/
 COPY app/ ./app/
