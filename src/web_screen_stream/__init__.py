@@ -3,5 +3,12 @@
 from web_screen_stream.config import StreamConfig
 from web_screen_stream.ffmpeg_source import FFmpegSource
 from web_screen_stream.h264_extractor import H264UnitExtractor
+from web_screen_stream.session import BrowserStreamSession, SessionManager
 
-__all__ = ["FFmpegSource", "H264UnitExtractor", "StreamConfig"]
+__all__ = [
+    "BrowserStreamSession",
+    "FFmpegSource",
+    "H264UnitExtractor",
+    "SessionManager",
+    "StreamConfig",
+]
