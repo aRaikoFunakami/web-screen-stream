@@ -21,6 +21,11 @@ cd web-screen-stream
 make setup
 ```
 
+注意:
+
+- 初回は Docker イメージのビルド（Playwright/Chromium 含む）で数分かかることがあります
+- 使用ポート: backend `8200` / frontend `3001`（他プロセスが使用中だと起動に失敗します）
+
 ブラウザで http://localhost:3001/ にアクセスすると、セッション作成・切り替え・停止とストリーム再生まで一通り試せます。
 
 停止する場合:
