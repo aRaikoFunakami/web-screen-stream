@@ -183,24 +183,56 @@ class XvfbManager:
                 xvfb_proc.pid,
             )
 
-            # 4. Fluxbox 起動（Xvfb の display を指定）
+            # 4. Fluxbox 設定: init + apps を書き込み
+            #    init: グローバル設定（デコレーション無効、ツールバー非表示）
+            #    apps: ウィンドウルール（全ウィンドウ最大化 + 装飾なし）
+            fluxbox_home = "/root"
+            fluxbox_dir = os.path.join(fluxbox_home, ".fluxbox")
+            os.makedirs(fluxbox_dir, exist_ok=True)
+
+            init_path = os.path.join(fluxbox_dir, "init")
+            with open(init_path, "w") as f:
+                f.write(
+                    "session.screen0.defaultDeco: NONE\n"
+                    "session.screen0.toolbar.visible: false\n"
+                    "session.screen0.focusModel: ClickFocus\n"
+                    "session.screen0.maxDisableMove: true\n"
+                    "session.screen0.maxDisableResize: true\n"
+                )
+
+            apps_path = os.path.join(fluxbox_dir, "apps")
+            with open(apps_path, "w") as f:
+                f.write(
+                    "[app] (name=.*)\n"
+                    "  [Maximized] {yes}\n"
+                    "  [Deco] {NONE}\n"
+                    "[end]\n"
+                )
+
+            logger.info(
+                "Fluxbox config written: init=%s, apps=%s",
+                init_path,
+                apps_path,
+            )
+
+            # 5. Fluxbox 起動（Xvfb の display を指定）
             fluxbox_proc = await asyncio.create_subprocess_exec(
                 "fluxbox",
                 "-display",
                 display,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
-                env={**os.environ, "DISPLAY": display, "HOME": "/root"},
+                env={**os.environ, "DISPLAY": display, "HOME": fluxbox_home},
                 start_new_session=True,
             )
 
-            # 5. Fluxbox 起動待ち
+            # 6. Fluxbox 起動待ち
             await asyncio.sleep(self._FLUXBOX_WAIT)
             logger.info(
                 "Fluxbox started on %s (PID=%d)", display, fluxbox_proc.pid
             )
 
-            # 6. 管理テーブルに登録
+            # 7. 管理テーブルに登録
             info = DisplayInfo(
                 display=display,
                 xvfb_proc=xvfb_proc,
