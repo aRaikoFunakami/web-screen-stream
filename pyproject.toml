@@ -1,6 +1,6 @@
 [project]
 name = "web-screen-stream"
-version = "0.1.0"
+version = "1.0.0"
 description = "Browser screen streaming via Xvfb + FFmpeg H.264 + WebSocket"
 readme = "README.md"
 requires-python = ">=3.13"
