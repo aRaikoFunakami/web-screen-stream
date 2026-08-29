@@ -185,7 +185,17 @@ class XvfbManager:
 
             # 4. Fluxbox 設定: init + apps を書き込み
             #    init: グローバル設定（デコレーション無効、ツールバー非表示）
-            #    apps: ウィンドウルール（全ウィンドウ最大化 + 装飾なし）
+            #    apps: Chromium クラスのウィンドウにのみ EWMH fullscreen を強制
+            #    （smartestiroid-ui#335）。[Maximized] は装飾除去とサイズ一致のみで
+            #    Chromium 自身の chrome UI（タブバー・URL バー）は消えない。
+            #    [Fullscreen] は _NET_WM_STATE_FULLSCREEN を立てる:
+            #    - window.open() ポップアップ等の追加ウィンドウは、これを検知した
+            #      Chromium が chrome UI を自ら非表示にする（F11 相当、実測確認済み）
+            #    - Playwright launch() 経由の初回ウィンドウはこの通知に反応しない
+            #      ため、呼び出し側で CDP Browser.setWindowBounds
+            #      {windowState: fullscreen} を併用すること（実測確認済み）
+            #    ルールを (name=.*) の全窓一致にしないのは、Fluxbox 自身が出す
+            #    xmessage 等のダイアログまで fullscreen 化され録画を覆うため（実測）。
             fluxbox_home = "/root"
             fluxbox_dir = os.path.join(fluxbox_home, ".fluxbox")
             os.makedirs(fluxbox_dir, exist_ok=True)
@@ -203,8 +213,8 @@ class XvfbManager:
             apps_path = os.path.join(fluxbox_dir, "apps")
             with open(apps_path, "w") as f:
                 f.write(
-                    "[app] (name=.*)\n"
-                    "  [Maximized] {yes}\n"
+                    "[app] (class=Chromium.*)\n"
+                    "  [Fullscreen] {yes}\n"
                     "  [Deco] {NONE}\n"
                     "[end]\n"
                 )
