@@ -55,5 +55,9 @@ else
 fi
 
 # FastAPI サーバー起動
+# `uv run` 経由だと uv 自身が PID 1 のまま残り、Python は子プロセスになる。
+# reparent された孤児プロセス（chrome_crashpad 等）は PID 1 でないと
+# os.waitpid で回収できず zombie 化するため、venv の uvicorn を直接 exec して
+# Python プロセス自体を PID 1 にする（SessionManager._reap_chrome_pids 参照）。
 echo "Starting server on port ${PORT}..."
-exec uv run uvicorn app.main:app --host 0.0.0.0 --port ${PORT}
+exec .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${PORT}

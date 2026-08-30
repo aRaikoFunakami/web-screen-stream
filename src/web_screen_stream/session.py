@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import signal
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -300,6 +302,93 @@ class BrowserStreamSession:
             logger.info("Broadcast loop ended for session %s", self._session_id)
 
 
+# chrome_crashpad 等の生存確認後、SIGTERM の猶予として待つ秒数
+_CHROME_REAP_SIGTERM_WAIT = 2.0
+
+
+def _snapshot_chrome_pids() -> set[int]:
+    """/proc から chrome 系プロセス（chrome, chrome_crashpad 等）の PID 集合を取得する.
+
+    Linux 専用。/proc が無い環境（macOS 開発機など）では空集合を返す。
+    """
+    pids: set[int] = set()
+    try:
+        entries = os.listdir("/proc")
+    except FileNotFoundError:
+        return pids
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/comm") as f:
+                comm = f.read().strip()
+        except OSError:
+            continue
+        if comm.startswith("chrome"):
+            pids.add(int(entry))
+    return pids
+
+
+def _pid_alive(pid: int) -> bool:
+    """PID が生存しているか確認する（シグナルは送らない）."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _reap_chrome_pids(pids: set[int]) -> None:
+    """browser.close() で終了しなかった chrome 系プロセスを個別に刈り取る.
+
+    crashpad handler はブラウザ本体への CDP close に反応せず、コンテナの
+    PID 1（本プロセス）に reparent されたまま生き残る設計のため、
+    `_launch_browser` が launch 前後の /proc 差分で記録した PID を対象に
+    SIGTERM → 猶予 → SIGKILL する。Playwright は Node driver 経由で
+    Chromium を起動しており、Python 側はプロセスグループを所有していない
+    ため killpg ではなく PID 単位で kill する。
+    reparent 後は本プロセスが実の親になるため、kill しただけでは zombie
+    （PID 1 が回収しない限り消えない）として残る。自分の子として
+    os.waitpid で回収する。
+    """
+    survivors = {pid for pid in pids if _pid_alive(pid)}
+    if not survivors:
+        return
+
+    logger.warning("Reaping leftover chrome processes: %s", sorted(survivors))
+    for pid in survivors:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    await asyncio.sleep(_CHROME_REAP_SIGTERM_WAIT)
+
+    for pid in survivors:
+        if _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+                logger.warning("Force-killed leftover chrome process PID=%d", pid)
+            except ProcessLookupError:
+                pass
+
+    # reparent の完了を少し待って回収（自分の子でなければ ChildProcessError → 諦める）
+    for _ in range(10):
+        for pid in list(survivors):
+            try:
+                waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                survivors.discard(pid)
+                continue
+            if waited_pid == pid:
+                survivors.discard(pid)
+        if not survivors:
+            break
+        await asyncio.sleep(0.1)
+
+
 class SessionManager:
     """ブラウザストリーミングセッションの管理.
 
@@ -312,6 +401,7 @@ class SessionManager:
         self._sessions: dict[str, BrowserStreamSession] = {}
         self._browsers: dict[str, tuple[Any, Any, Any]] = {}
         # (playwright_instance, browser, page)
+        self._browser_pids: dict[str, set[int]] = {}  # session_id → chrome系PID集合
         self._displays: dict[str, str] = {}  # session_id → display
         self._xvfb = xvfb_manager
         self._lock = asyncio.Lock()
@@ -351,6 +441,7 @@ class SessionManager:
             display = None
             pw = None
             browser = None
+            chrome_pids: set[int] = set()
 
             try:
                 # Phase 1: ディスプレイ確保（XvfbManager がある場合）
@@ -369,11 +460,12 @@ class SessionManager:
 
                 # Phase 2: ブラウザ起動（url が指定された場合）
                 if url:
-                    pw, browser, page = await self._launch_browser(
+                    pw, browser, page, chrome_pids = await self._launch_browser(
                         session_id, config, url
                     )
                     if pw is not None:
                         self._browsers[session_id] = (pw, browser, page)
+                        self._browser_pids[session_id] = chrome_pids
 
                 # Phase 3: FFmpeg + ストリーミング開始
                 session = BrowserStreamSession(session_id, config, url=url)
@@ -401,7 +493,10 @@ class SessionManager:
                         logger.exception(
                             "Cleanup: error stopping playwright for %s", session_id
                         )
+                if chrome_pids:
+                    await _reap_chrome_pids(chrome_pids)
                 self._browsers.pop(session_id, None)
+                self._browser_pids.pop(session_id, None)
                 if display and self._xvfb:
                     try:
                         await self._xvfb.release(display)
@@ -433,6 +528,7 @@ class SessionManager:
                 raise KeyError(f"Session {session_id} not found")
 
             browser_info = self._browsers.pop(session_id, None)
+            chrome_pids = self._browser_pids.pop(session_id, None)
             display = self._displays.pop(session_id, None)
 
         # ロック外で停止（I/O 待ちが長い可能性）
@@ -458,6 +554,9 @@ class SessionManager:
                 logger.exception(
                     "Error stopping playwright for session %s", session_id
                 )
+            # crashpad handler 等、CDP close に反応せず生き残るプロセスを刈り取る
+            if chrome_pids:
+                await _reap_chrome_pids(chrome_pids)
 
         # 3. Xvfb + Fluxbox 解放
         if display and self._xvfb:
@@ -500,19 +599,24 @@ class SessionManager:
 
     async def _launch_browser(
         self, session_id: str, config: StreamConfig, url: str
-    ) -> tuple[Any, Any, Any]:
+    ) -> tuple[Any, Any, Any, set[int]]:
         """Playwright Chromium を起動してページを開く.
 
+        launch 前後で /proc の chrome 系 PID を差分取得し、browser.close()
+        では終了しない crashpad handler 等を後で個別に刈り取れるようにする
+        （`_reap_chrome_pids` 参照）。
+
         Returns:
-            (playwright_instance, browser, page) のタプル
-            Playwright が利用不可の場合は (None, None, None)
+            (playwright_instance, browser, page, chrome_pids) のタプル
+            Playwright が利用不可の場合は (None, None, None, set())
         """
         try:
             from playwright.async_api import async_playwright
         except ImportError:
             logger.warning("Playwright not available, skipping browser launch")
-            return (None, None, None)
+            return (None, None, None, set())
 
+        pids_before = _snapshot_chrome_pids()
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(
             headless=False,
@@ -539,13 +643,16 @@ class SessionManager:
                 await pw.stop()
             except Exception:
                 pass
+            await _reap_chrome_pids(_snapshot_chrome_pids() - pids_before)
             raise RuntimeError(f"URL '{url}' を開けませんでした: {e}") from e
 
+        chrome_pids = _snapshot_chrome_pids() - pids_before
         logger.info(
-            "Browser launched for session %s: %s (%dx%d)",
+            "Browser launched for session %s: %s (%dx%d, chrome_pids=%d)",
             session_id,
             url,
             config.width,
             config.height,
+            len(chrome_pids),
         )
-        return (pw, browser, page)
+        return (pw, browser, page, chrome_pids)
