@@ -10,6 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     fluxbox \
     x11-utils \
+    # Fluxbox が起動時に自動実行する fbsetbg 用（無いと壁紙設定に失敗し、
+    # xmessage エラーダイアログが Fluxbox とは別プロセスグループで残り、
+    # release() 後にゾンビとして居残るプロセスリークになる。実測確認済み）
+    hsetroot \
     # FFmpeg
     ffmpeg \
     # Chromium (Playwright) 依存
