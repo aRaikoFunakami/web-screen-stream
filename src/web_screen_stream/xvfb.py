@@ -10,6 +10,8 @@ import os
 import signal
 from dataclasses import dataclass, field
 
+from web_screen_stream.focus_relay import CHROMIUM_WM_CLASS_PATTERN, FocusRelay
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,6 +75,7 @@ class DisplayInfo:
     fluxbox_proc: asyncio.subprocess.Process
     width: int
     height: int
+    focus_relay: FocusRelay | None = None
 
 
 class XvfbManager:
@@ -183,72 +186,103 @@ class XvfbManager:
                 xvfb_proc.pid,
             )
 
-            # 4. Fluxbox 設定: init + apps を書き込み
-            #    init: グローバル設定（デコレーション無効、ツールバー非表示）
-            #    apps: Chromium クラスのウィンドウにのみ EWMH fullscreen を強制
-            #    （smartestiroid-ui#335）。[Maximized] は装飾除去とサイズ一致のみで
-            #    Chromium 自身の chrome UI（タブバー・URL バー）は消えない。
-            #    [Fullscreen] は _NET_WM_STATE_FULLSCREEN を立てる:
-            #    - window.open() ポップアップ等の追加ウィンドウは、これを検知した
-            #      Chromium が chrome UI を自ら非表示にする（F11 相当、実測確認済み）
-            #    - Playwright launch() 経由の初回ウィンドウはこの通知に反応しない
-            #      ため、呼び出し側で CDP Browser.setWindowBounds
-            #      {windowState: fullscreen} を併用すること（実測確認済み）
-            #    ルールを (name=.*) の全窓一致にしないのは、Fluxbox 自身が出す
-            #    xmessage 等のダイアログまで fullscreen 化され録画を覆うため（実測）。
-            fluxbox_home = "/root"
-            fluxbox_dir = os.path.join(fluxbox_home, ".fluxbox")
-            os.makedirs(fluxbox_dir, exist_ok=True)
+            # 4-8: Fluxbox 設定 + 起動 + FocusRelay 起動。
+            # 失敗時は起動済みリソースを逆順で後始末してから再送出する
+            # （途中失敗で Xvfb だけがリークするのを防ぐ）。
+            fluxbox_proc: asyncio.subprocess.Process | None = None
+            try:
+                # 4. Fluxbox 設定: init + apps を書き込み
+                #    init: グローバル設定（デコレーション無効、ツールバー非表示）
+                #    apps: Chromium クラスのウィンドウにのみ EWMH fullscreen を強制
+                #    （smartestiroid-ui#335）。[Maximized] は装飾除去とサイズ一致のみで
+                #    Chromium 自身の chrome UI（タブバー・URL バー）は消えない。
+                #    [Fullscreen] は _NET_WM_STATE_FULLSCREEN を立てる:
+                #    - window.open() ポップアップ等の追加ウィンドウは、これを検知した
+                #      Chromium が chrome UI を自ら非表示にする（F11 相当、実測確認済み）
+                #    - Playwright launch() 経由の初回ウィンドウはこの通知に反応しない
+                #      ため、呼び出し側で CDP Browser.setWindowBounds
+                #      {windowState: fullscreen} を併用すること（実測確認済み）
+                #    ルールを (name=.*) の全窓一致にしないのは、Fluxbox 自身が出す
+                #    xmessage 等のダイアログまで fullscreen 化され録画を覆うため（実測）。
+                #    class パターンは focus_relay.CHROMIUM_WM_CLASS_PATTERN と
+                #    同一の文字列を使い、両ファイルの対象スコープを一致させる。
+                fluxbox_home = "/root"
+                fluxbox_dir = os.path.join(fluxbox_home, ".fluxbox")
+                os.makedirs(fluxbox_dir, exist_ok=True)
 
-            init_path = os.path.join(fluxbox_dir, "init")
-            with open(init_path, "w") as f:
-                f.write(
-                    "session.screen0.defaultDeco: NONE\n"
-                    "session.screen0.toolbar.visible: false\n"
-                    "session.screen0.focusModel: ClickFocus\n"
-                    "session.screen0.maxDisableMove: true\n"
-                    "session.screen0.maxDisableResize: true\n"
+                init_path = os.path.join(fluxbox_dir, "init")
+                with open(init_path, "w") as f:
+                    f.write(
+                        "session.screen0.defaultDeco: NONE\n"
+                        "session.screen0.toolbar.visible: false\n"
+                        "session.screen0.focusModel: ClickFocus\n"
+                        "session.screen0.maxDisableMove: true\n"
+                        "session.screen0.maxDisableResize: true\n"
+                    )
+
+                apps_path = os.path.join(fluxbox_dir, "apps")
+                with open(apps_path, "w") as f:
+                    f.write(
+                        f"[app] (class={CHROMIUM_WM_CLASS_PATTERN})\n"
+                        "  [Fullscreen] {yes}\n"
+                        "  [Deco] {NONE}\n"
+                        "[end]\n"
+                    )
+
+                logger.info(
+                    "Fluxbox config written: init=%s, apps=%s",
+                    init_path,
+                    apps_path,
                 )
 
-            apps_path = os.path.join(fluxbox_dir, "apps")
-            with open(apps_path, "w") as f:
-                f.write(
-                    "[app] (class=Chromium.*)\n"
-                    "  [Fullscreen] {yes}\n"
-                    "  [Deco] {NONE}\n"
-                    "[end]\n"
+                # 5. Fluxbox 起動（Xvfb の display を指定）
+                fluxbox_proc = await asyncio.create_subprocess_exec(
+                    "fluxbox",
+                    "-display",
+                    display,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    env={**os.environ, "DISPLAY": display, "HOME": fluxbox_home},
+                    start_new_session=True,
                 )
 
-            logger.info(
-                "Fluxbox config written: init=%s, apps=%s",
-                init_path,
-                apps_path,
-            )
+                # 6. Fluxbox 起動待ち
+                await asyncio.sleep(self._FLUXBOX_WAIT)
+                logger.info(
+                    "Fluxbox started on %s (PID=%d)", display, fluxbox_proc.pid
+                )
 
-            # 5. Fluxbox 起動（Xvfb の display を指定）
-            fluxbox_proc = await asyncio.create_subprocess_exec(
-                "fluxbox",
-                "-display",
-                display,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                env={**os.environ, "DISPLAY": display, "HOME": fluxbox_home},
-                start_new_session=True,
-            )
+                # 7. FocusRelay 起動（smartestiroid-ui/web-screen-stream#2）
+                #    Fluxbox の focus-stealing 防止から、複数ウィンドウ切替時の
+                #    前面化を救済する。接続失敗は non-fatal（ログのみ）:
+                #    単一ウィンドウ・多数タブのケースには影響させない。
+                focus_relay: FocusRelay | None = FocusRelay(display)
+                try:
+                    await focus_relay.start()
+                except Exception:
+                    logger.exception(
+                        "FocusRelay failed to start on %s, continuing without it",
+                        display,
+                    )
+                    focus_relay = None
+            except Exception:
+                logger.error(
+                    "Fluxbox/FocusRelay setup failed on %s, cleaning up", display
+                )
+                if fluxbox_proc is not None:
+                    await self._kill_process(fluxbox_proc)
+                await self._kill_process(xvfb_proc)
+                self._cleanup_stale_lock(display_num)
+                raise
 
-            # 6. Fluxbox 起動待ち
-            await asyncio.sleep(self._FLUXBOX_WAIT)
-            logger.info(
-                "Fluxbox started on %s (PID=%d)", display, fluxbox_proc.pid
-            )
-
-            # 7. 管理テーブルに登録
+            # 8. 管理テーブルに登録
             info = DisplayInfo(
                 display=display,
                 xvfb_proc=xvfb_proc,
                 fluxbox_proc=fluxbox_proc,
                 width=width,
                 height=height,
+                focus_relay=focus_relay,
             )
             self._displays[display] = info
             return display
@@ -266,8 +300,15 @@ class XvfbManager:
                 return
 
         # ロック外で停止（I/O 待ちが長い可能性）
-        # 停止順序: Fluxbox → Xvfb
+        # 停止順序: FocusRelay → Fluxbox → Xvfb
+        # （root ウィンドウが消える前に X 接続を畳んでおく）
         logger.info("Releasing display %s", display)
+
+        if info.focus_relay is not None:
+            try:
+                await info.focus_relay.stop()
+            except Exception:
+                logger.exception("Error stopping FocusRelay on %s", display)
 
         await self._stop_process(info.fluxbox_proc, "Fluxbox", display)
         await self._stop_process(info.xvfb_proc, "Xvfb", display)
