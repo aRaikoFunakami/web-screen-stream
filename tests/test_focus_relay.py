@@ -4,6 +4,7 @@ python-xlib は MagicMock でスタブし、実 X サーバー無しでロジッ
 (Issue: https://github.com/aRaikoFunakami/web-screen-stream/issues/2)
 """
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -11,6 +12,7 @@ import pytest
 from Xlib import X
 from Xlib.error import BadWindow, ConnectionClosedError
 
+from web_screen_stream import focus_relay as focus_relay_module
 from web_screen_stream.focus_relay import FocusRelay
 
 ATOMS = {
@@ -96,6 +98,19 @@ class TestIsChromium:
         relay = make_relay()
         win = make_window(1)
         win.get_wm_class.side_effect = _bad_window()
+        assert relay._is_chromium(win) is False
+
+    def test_non_xerror_from_get_wm_class_does_not_propagate(self):
+        """WM_CLASS が UTF8_STRING型かつ不正バイト列だと python-xlib は
+        UnicodeDecodeError を送出する（XError のサブクラスではない）。
+        ここで拾い損ねると、無関係な1ウィンドウのせいで
+        _on_readable まで例外が伝播し reader が外れ、リレー機能全体が
+        セッションの残り全期間停止してしまう（コードレビューで確認済み）。"""
+        relay = make_relay()
+        win = make_window(1)
+        win.get_wm_class.side_effect = UnicodeDecodeError(
+            "utf-8", b"\xff", 0, 1, "invalid start byte"
+        )
         assert relay._is_chromium(win) is False
 
 
@@ -247,12 +262,17 @@ class TestRefreshClientList:
 
 
 class TestHandlePropertyNotify:
+    """event.atom は整数 ID として直接比較する（get_atom_name() は使わない:
+    毎回 X サーバーへの同期往復が発生する上、BadAtom 発生時に
+    _on_readable のドレインループ全体を中断させてしまうため）。"""
+
     def test_root_client_list_change_triggers_refresh(self):
         relay = make_relay()
         relay._refresh_client_list = MagicMock()
-        relay._display.get_atom_name.return_value = "_NET_CLIENT_LIST"
 
-        relay._handle_property_notify(property_notify(relay._root, 999))
+        relay._handle_property_notify(
+            property_notify(relay._root, ATOMS["_NET_CLIENT_LIST"])
+        )
 
         relay._refresh_client_list.assert_called_once()
 
@@ -260,9 +280,10 @@ class TestHandlePropertyNotify:
         relay = make_relay()
         relay._maybe_activate = MagicMock()
         win = make_window(5)
-        relay._display.get_atom_name.return_value = "_NET_WM_STATE"
 
-        relay._handle_property_notify(property_notify(win, 999))
+        relay._handle_property_notify(
+            property_notify(win, ATOMS["_NET_WM_STATE"])
+        )
 
         relay._maybe_activate.assert_called_once_with(win)
 
@@ -271,12 +292,22 @@ class TestHandlePropertyNotify:
         relay._maybe_activate = MagicMock()
         relay._refresh_client_list = MagicMock()
         win = make_window(5)
-        relay._display.get_atom_name.return_value = "WM_NAME"
 
-        relay._handle_property_notify(property_notify(win, 999))
+        relay._handle_property_notify(property_notify(win, 999))  # 未知の atom
 
         relay._maybe_activate.assert_not_called()
         relay._refresh_client_list.assert_not_called()
+
+    def test_no_get_atom_name_round_trip(self):
+        """get_atom_name() への同期往復が発生しないことを確認."""
+        relay = make_relay()
+        relay._refresh_client_list = MagicMock()
+
+        relay._handle_property_notify(
+            property_notify(relay._root, ATOMS["_NET_CLIENT_LIST"])
+        )
+
+        relay._display.get_atom_name.assert_not_called()
 
 
 # ============================================================
@@ -369,3 +400,47 @@ class TestLifecycle:
         await relay.stop()  # 例外を送出しないこと
 
         assert relay._display is None
+
+    @pytest.mark.asyncio
+    async def test_start_failure_after_partial_connect_closes_display(self):
+        """_connect() が Display() 確立後に例外を送出した場合でも、
+        start() は確立済みの接続を必ず閉じてから例外を再送出する
+        （fd リーク防止。コードレビューで確認済み）。"""
+        relay = FocusRelay(":100")
+        opened_display = MagicMock()
+
+        def fake_connect():
+            # Display() 確立には成功し、その後の atom intern 等で失敗する
+            # という実際の部分失敗パターンを再現する。
+            relay._display = opened_display
+            raise RuntimeError("intern_atom failed")
+
+        relay._connect = fake_connect
+
+        with pytest.raises(RuntimeError):
+            await relay.start()
+
+        opened_display.close.assert_called_once()
+        assert relay._display is None
+
+    @pytest.mark.asyncio
+    async def test_start_timeout_closes_partial_connection(self):
+        """X サーバー不応答で接続確立が固まった場合、無期限に待たず
+        タイムアウトし、呼び出し元のロックを握り続けない
+        （コードレビューで確認済み）。"""
+        relay = FocusRelay(":100")
+
+        def fake_connect():
+            import time
+
+            time.sleep(0.5)
+
+        relay._connect = fake_connect
+
+        original_timeout = focus_relay_module._CONNECT_TIMEOUT
+        focus_relay_module._CONNECT_TIMEOUT = 0.05
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await relay.start()
+        finally:
+            focus_relay_module._CONNECT_TIMEOUT = original_timeout

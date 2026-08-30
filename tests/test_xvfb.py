@@ -87,6 +87,10 @@ class TestAllocateFocusRelayWiring:
         # Xvfb/Fluxbox 自体は通常通り起動している
         assert info.xvfb_proc is xvfb_proc
         assert info.fluxbox_proc is fluxbox_proc
+        # start() が部分的に成功していた場合の X11 接続 fd リーク防止
+        # （コードレビューで確認済みの修正）: 失敗時も必ず stop() で
+        # 後始末してから参照を破棄すること。
+        relay_instance.stop.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_fluxbox_start_failure_cleans_up_xvfb(
@@ -112,6 +116,30 @@ class TestAllocateFocusRelayWiring:
         assert manager._displays == {}
         # relay は Fluxbox 失敗より後段のため、生成すらされない
         relay_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fluxbox_start_failure_logs_traceback(
+        self, manager, mock_focus_relay, caplog
+    ):
+        """logger.exception を使い、失敗原因のトレースバックが
+        ログに残ること（コードレビューで確認済みの修正）。"""
+        xvfb_proc = make_fake_proc(90012)
+        create_mock = AsyncMock(
+            side_effect=[xvfb_proc, FileNotFoundError("fluxbox: not found")]
+        )
+
+        with patch.object(asyncio, "create_subprocess_exec", create_mock), patch(
+            "builtins.open", mock_open()
+        ), caplog.at_level("ERROR"):
+            with pytest.raises(FileNotFoundError):
+                await manager.allocate(1280, 720)
+
+        records = [r for r in caplog.records if "cleaning up" in r.message]
+        assert records, "expected an error log for the cleanup path"
+        assert records[0].exc_info is not None, (
+            "logger.exception (not logger.error) should be used so the "
+            "traceback is preserved"
+        )
 
 
 class TestReleaseFocusRelayWiring:

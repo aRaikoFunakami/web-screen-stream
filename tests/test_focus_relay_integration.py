@@ -20,7 +20,7 @@ from Xlib import X
 from Xlib.display import Display
 from Xlib.protocol import event as xevent
 
-from web_screen_stream.focus_relay import FocusRelay
+from web_screen_stream.focus_relay import FocusRelay, render_fluxbox_apps_config
 
 pytestmark = pytest.mark.skipif(
     not (shutil.which("Xvfb") and shutil.which("fluxbox")),
@@ -78,12 +78,9 @@ def xvfb_fluxbox(tmp_path):
         "session.screen0.defaultDeco: NONE\n"
         "session.screen0.focusModel: ClickFocus\n"
     )
-    (fluxbox_home / ".fluxbox" / "apps").write_text(
-        "[app] (class=Chromium.*)\n"
-        "  [Fullscreen] {yes}\n"
-        "  [Deco] {NONE}\n"
-        "[end]\n"
-    )
+    # xvfb.py の allocate() と同じ生成元を使い、本番の apps ルールと
+    # このテストのスコープがドリフトしないようにする。
+    (fluxbox_home / ".fluxbox" / "apps").write_text(render_fluxbox_apps_config())
     fluxbox = subprocess.Popen(
         ["fluxbox", "-display", TEST_DISPLAY],
         stdout=subprocess.DEVNULL,

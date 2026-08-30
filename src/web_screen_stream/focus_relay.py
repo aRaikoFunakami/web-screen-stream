@@ -32,9 +32,31 @@ logger = logging.getLogger(__name__)
 CHROMIUM_WM_CLASS_PATTERN = "Chromium.*"
 _CHROMIUM_CLASS_RE = re.compile(CHROMIUM_WM_CLASS_PATTERN)
 
+
+def render_fluxbox_apps_config() -> str:
+    """Fluxbox `apps` ファイルの内容を返す（唯一の生成元）.
+
+    XvfbManager.allocate() と統合テストの両方がここを経由することで、
+    実際に書き込まれる apps ルールと `_is_chromium()` のスコープが
+    ドリフトしないようにする。
+    """
+    return (
+        f"[app] (class={CHROMIUM_WM_CLASS_PATTERN})\n"
+        "  [Fullscreen] {yes}\n"
+        "  [Deco] {NONE}\n"
+        "[end]\n"
+    )
+
+
 # _NET_ACTIVE_WINDOW の source indication: 2 = pager（実測: Fluxbox の
 # focus-stealing 防止を無条件で回避できる唯一のソース種別。0/1 は拒否される）
 _SOURCE_INDICATION_PAGER = 2
+
+# X 接続確立のタイムアウト。X サーバーが不応答のまま無期限に
+# ブロックすると、呼び出し元 (XvfbManager.allocate()) の排他ロックを
+# 握ったまま戻らなくなり、他の全セッションの allocate()/release() が
+# 巻き込まれて停止する（コードレビューで確認済み）。
+_CONNECT_TIMEOUT = 5.0
 
 
 class FocusRelay:
@@ -67,7 +89,17 @@ class FocusRelay:
         # スレッドに逃がす。以降のイベント処理は add_reader 経由の
         # 非ブロッキング呼び出しのみ（next_event は pending_events()
         # で readable を確認済みの場合だけ呼ぶ）。
-        await asyncio.to_thread(self._connect)
+        # タイムアウトも設ける: X サーバー不応答時に呼び出し元の
+        # ロックを無期限に握り続けないため。
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self._connect), timeout=_CONNECT_TIMEOUT
+            )
+        except (Exception, asyncio.CancelledError):
+            # 部分的に確立済みの接続が残っていれば必ず閉じる
+            # （X11 fd リークの防止）。
+            await self._close()
+            raise
 
         self._fd = self._display.fileno()
         self._loop.add_reader(self._fd, self._on_readable)
@@ -91,20 +123,25 @@ class FocusRelay:
 
     async def stop(self) -> None:
         """監視を止めて X 接続を閉じる."""
-        if self._loop is not None and self._fd is not None:
-            self._loop.remove_reader(self._fd)
+        await self._close()
+        logger.info("FocusRelay stopped on %s", self._display_name)
+
+    async def _close(self) -> None:
+        """reader を外し X 接続を閉じる（start() の失敗経路からも共用）."""
+        self._detach_reader()
         if self._display is not None:
             try:
-                self._display.close()
+                # close() は内部でソケットへの flush を伴いうる同期
+                # I/O（相手が応答不能だと事実上ブロックしうる）ため、
+                # _connect() と対称に to_thread に逃がす。
+                await asyncio.to_thread(self._display.close)
             except Exception:
                 logger.exception(
                     "Error closing X display %s", self._display_name
                 )
         self._display = None
         self._root = None
-        self._fd = None
         self._watched.clear()
-        logger.info("FocusRelay stopped on %s", self._display_name)
 
     # ------------------------------------------------------------
     # 内部実装
@@ -145,14 +182,18 @@ class FocusRelay:
             self._fd = None
 
     def _handle_property_notify(self, event) -> None:
-        assert self._display is not None and self._root is not None
-        atom_name = self._display.get_atom_name(event.atom)
+        assert self._root is not None
+        # event.atom は既に intern 済みの整数 atom ID なので、
+        # self._atoms と直接比較する（get_atom_name() は毎回 X サーバー
+        # への同期往復が発生する上、BadAtom を送出しうる = 1回の
+        # readable でまとめて届いた後続イベントのドレインが中断される
+        # リスクがあった。整数比較ならその往復も例外経路も無い）。
         if event.window.id == self._root.id:
-            if atom_name == "_NET_CLIENT_LIST":
+            if event.atom == self._atoms["_NET_CLIENT_LIST"]:
                 self._refresh_client_list()
             return
 
-        if atom_name == "_NET_WM_STATE":
+        if event.atom == self._atoms["_NET_WM_STATE"]:
             self._maybe_activate(event.window)
 
     def _refresh_client_list(self) -> None:
@@ -206,7 +247,13 @@ class FocusRelay:
     def _is_chromium(self, window: Window) -> bool:
         try:
             wm_class = window.get_wm_class()
-        except XError:
+        except Exception:
+            # XError（BadWindow等）に加え、WM_CLASS が UTF8_STRING型
+            # かつ不正バイト列だった場合 python-xlib は UnicodeDecodeError
+            # を送出する（XError のサブクラスではない）。ここで拾い損ねると
+            # 呼び出し元の _on_readable まで伝播し、無関係な1ウィンドウの
+            # せいでリレー機能全体が停止してしまう（コードレビューで確認済
+            # み）。「判定できない = Chromium ではない」として扱えば十分。
             return False
         if not wm_class:
             return False

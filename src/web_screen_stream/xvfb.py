@@ -10,7 +10,7 @@ import os
 import signal
 from dataclasses import dataclass, field
 
-from web_screen_stream.focus_relay import CHROMIUM_WM_CLASS_PATTERN, FocusRelay
+from web_screen_stream.focus_relay import FocusRelay, render_fluxbox_apps_config
 
 logger = logging.getLogger(__name__)
 
@@ -204,8 +204,9 @@ class XvfbManager:
                 #      {windowState: fullscreen} を併用すること（実測確認済み）
                 #    ルールを (name=.*) の全窓一致にしないのは、Fluxbox 自身が出す
                 #    xmessage 等のダイアログまで fullscreen 化され録画を覆うため（実測）。
-                #    class パターンは focus_relay.CHROMIUM_WM_CLASS_PATTERN と
-                #    同一の文字列を使い、両ファイルの対象スコープを一致させる。
+                #    apps ファイルの内容は focus_relay.render_fluxbox_apps_config()
+                #    が唯一の生成元（統合テストもここを経由し、対象スコープの
+                #    ドリフトを防ぐ）。
                 fluxbox_home = "/root"
                 fluxbox_dir = os.path.join(fluxbox_home, ".fluxbox")
                 os.makedirs(fluxbox_dir, exist_ok=True)
@@ -222,12 +223,7 @@ class XvfbManager:
 
                 apps_path = os.path.join(fluxbox_dir, "apps")
                 with open(apps_path, "w") as f:
-                    f.write(
-                        f"[app] (class={CHROMIUM_WM_CLASS_PATTERN})\n"
-                        "  [Fullscreen] {yes}\n"
-                        "  [Deco] {NONE}\n"
-                        "[end]\n"
-                    )
+                    f.write(render_fluxbox_apps_config())
 
                 logger.info(
                     "Fluxbox config written: init=%s, apps=%s",
@@ -264,9 +260,12 @@ class XvfbManager:
                         "FocusRelay failed to start on %s, continuing without it",
                         display,
                     )
+                    # start() が部分的に成功した場合（X 接続は確立済み）に
+                    # 備え、確実に閉じてから参照を破棄する（fd リーク防止）。
+                    await focus_relay.stop()
                     focus_relay = None
             except Exception:
-                logger.error(
+                logger.exception(
                     "Fluxbox/FocusRelay setup failed on %s, cleaning up", display
                 )
                 if fluxbox_proc is not None:
