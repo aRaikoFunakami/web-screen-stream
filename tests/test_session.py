@@ -4,12 +4,18 @@ FFmpegSource をモックして、マルチキャスト・Late-join・ライフ�
 """
 
 import asyncio
+import signal
 from collections.abc import AsyncIterator
 
 import pytest
 
 from web_screen_stream.h264_extractor import H264UnitExtractor
-from web_screen_stream.session import BrowserStreamSession, SessionManager, _SENTINEL
+from web_screen_stream.session import (
+    BrowserStreamSession,
+    SessionManager,
+    _SENTINEL,
+    _reap_chrome_pids,
+)
 
 SC4 = b"\x00\x00\x00\x01"
 
@@ -221,6 +227,144 @@ class TestSessionManager:
         mgr = SessionManager()
         with pytest.raises(KeyError, match="not found"):
             await mgr.stop("nonexistent")
+
+
+# ============================================================
+# chrome プロセスリークのテスト（crashpad handler 対策）
+# ============================================================
+
+
+class TestReapChromePids:
+    """_reap_chrome_pids のテスト.
+
+    browser.close() では終了しない chrome_crashpad 等を、launch 前後の
+    PID 差分に基づき SIGTERM→SIGKILL で個別に刈り取れることを確認する。
+    実際の Chromium は起動せず、os.kill を差し替えてプロセス生死を模擬する。
+    """
+
+    @pytest.mark.asyncio
+    async def test_survivor_gets_sigterm_then_sigkill(self, monkeypatch):
+        """SIGTERM で死なない PID は SIGKILL で刈り取られる."""
+        alive = {4242}  # SIGTERM を無視して生き残る PID（= chrome_crashpad 想定）
+        sent_signals: list[tuple[int, int]] = []
+
+        def fake_kill(pid, sig):
+            sent_signals.append((pid, sig))
+            if sig == 0:
+                if pid not in alive:
+                    raise ProcessLookupError
+                return
+            if sig == signal.SIGKILL:
+                alive.discard(pid)
+            # SIGTERM は無視（alive のまま）
+
+        async def fake_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("web_screen_stream.session.os.kill", fake_kill)
+        monkeypatch.setattr("web_screen_stream.session.asyncio.sleep", fake_sleep)
+
+        await _reap_chrome_pids({4242})
+
+        assert (4242, signal.SIGTERM) in sent_signals
+        assert (4242, signal.SIGKILL) in sent_signals
+        assert 4242 not in alive
+
+    @pytest.mark.asyncio
+    async def test_reparented_zombie_is_waitpid_reaped(self, monkeypatch):
+        """SIGKILL 後、reparent 済みの自分の子は os.waitpid で回収される.
+
+        コンテナの PID 1 に reparent された chrome_crashpad は kill しただけ
+        では zombie として残るため、os.waitpid(WNOHANG) で回収されることを
+        確認する（reparent 完了までの遅延を模したリトライも検証）。
+        """
+        waitpid_calls: list[int] = []
+        attempts = {"n": 0}
+
+        # _pid_alive: 最初の生存チェック(SIGTERM前)のみ True、以降(SIGKILL後の
+        # 再チェック含む)は False（= SIGKILL で死んだ）を返す。
+        alive_checks = {"n": 0}
+
+        def fake_kill(pid, sig):
+            if sig == 0:
+                alive_checks["n"] += 1
+                if alive_checks["n"] > 1:
+                    raise ProcessLookupError
+                return
+            # SIGTERM/SIGKILL の送信自体は成功扱い
+
+        def fake_waitpid(pid, options):
+            waitpid_calls.append(pid)
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                return (0, 0)  # まだ reparent/回収できていない
+            return (pid, 0)  # 回収成功
+
+        async def fake_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("web_screen_stream.session.os.kill", fake_kill)
+        monkeypatch.setattr("web_screen_stream.session.os.waitpid", fake_waitpid)
+        monkeypatch.setattr("web_screen_stream.session.asyncio.sleep", fake_sleep)
+
+        await _reap_chrome_pids({7777})
+
+        assert waitpid_calls.count(7777) == 3
+
+    @pytest.mark.asyncio
+    async def test_non_child_pid_gives_up_without_hanging(self, monkeypatch):
+        """自分の子でない PID は ChildProcessError で諦め、無限リトライしない."""
+        waitpid_calls: list[int] = []
+        alive_checks = {"n": 0}
+
+        def fake_kill(pid, sig):
+            if sig == 0:
+                alive_checks["n"] += 1
+                if alive_checks["n"] > 1:
+                    raise ProcessLookupError  # SIGKILL 後は死亡確認済み扱い
+                return  # 最初の _pid_alive チェックだけ生きている扱い
+
+        def fake_waitpid(pid, options):
+            waitpid_calls.append(pid)
+            raise ChildProcessError  # 自分の子ではない（reparent されていない等）
+
+        async def fake_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("web_screen_stream.session.os.kill", fake_kill)
+        monkeypatch.setattr("web_screen_stream.session.os.waitpid", fake_waitpid)
+        monkeypatch.setattr("web_screen_stream.session.asyncio.sleep", fake_sleep)
+
+        await _reap_chrome_pids({8888})  # ChildProcessError ですぐ諦め、ハングしない
+
+        assert waitpid_calls == [8888]  # リトライせず1回で諦めている
+
+    @pytest.mark.asyncio
+    async def test_already_dead_pid_is_noop(self, monkeypatch):
+        """既に終了している PID には何もシグナルを送らない."""
+        sent_signals: list[tuple[int, int]] = []
+
+        def fake_kill(pid, sig):
+            sent_signals.append((pid, sig))
+            if sig == 0:
+                raise ProcessLookupError  # 既に死んでいる
+            raise AssertionError("dead PID に SIGTERM/SIGKILL を送るべきではない")
+
+        monkeypatch.setattr("web_screen_stream.session.os.kill", fake_kill)
+
+        await _reap_chrome_pids({999})
+
+        assert sent_signals == [(999, 0)]
+
+    @pytest.mark.asyncio
+    async def test_empty_pids_is_noop(self, monkeypatch):
+        """PID 集合が空なら os.kill を一切呼ばない."""
+        def fake_kill(pid, sig):
+            raise AssertionError("空集合で kill が呼ばれるべきではない")
+
+        monkeypatch.setattr("web_screen_stream.session.os.kill", fake_kill)
+
+        await _reap_chrome_pids(set())
 
 
 # ============================================================
