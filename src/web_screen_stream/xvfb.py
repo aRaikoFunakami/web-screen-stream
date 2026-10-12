@@ -146,6 +146,8 @@ class XvfbManager:
         self._warned_held: dict[int, int] = {}
         # 確保の途中（Xvfb 起動済み・未登録）の番号。他者が握る番号と区別して使用中扱いにする
         self._pending: set[int] = set()
+        # 実行中の解放タスク（呼び出し側がキャンセルされても完走させるため参照を保持する）
+        self._release_tasks: set[asyncio.Future[None]] = set()
 
     async def allocate(self, width: int = 1280, height: int = 720) -> str:
         """新しいディスプレイを割り当て、Xvfb + Fluxbox を起動する.
@@ -352,20 +354,37 @@ class XvfbManager:
         Args:
             display: 解放するディスプレイ (例: ":100")
         """
-        display_num = int(display.lstrip(":"))
         async with self._lock:
             info = self._displays.pop(display, None)
             if info is None:
                 logger.warning("Display %s not found in managed displays", display)
                 return
+            display_num = int(display.lstrip(":"))  # 登録済みの display だけを解析する
             # 停止が終わるまでは、自分の Xvfb がまだ生きている。確保途中と同様に
             # 使用中として数え、他者（孤児）が握る番号と取り違えない。
             self._pending.add(display_num)
 
+        # 呼び出し側がキャンセルされても、Xvfb の停止・ロック清掃・pending の解除は
+        # 最後まで行う（途中で止まると、生きた自分の Xvfb が孤児扱いで残る）。
+        task = asyncio.ensure_future(self._finish_release(info, display, display_num))
+        self._release_tasks.add(task)
+        task.add_done_callback(self._on_release_done)
+        await asyncio.shield(task)
+
+    async def _finish_release(
+        self, info: DisplayInfo, display: str, display_num: int
+    ) -> None:
+        """停止を行い、成否に関わらず pending を解除する."""
         try:
             await self._stop_display(info, display, display_num)
         finally:
             self._pending.discard(display_num)
+
+    def _on_release_done(self, task: "asyncio.Future[None]") -> None:
+        self._release_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            # 呼び出し側がキャンセル済みで結果を受け取れない場合に備え、ログに残す
+            logger.error("Display release failed", exc_info=task.exception())
 
     async def _stop_display(
         self, info: DisplayInfo, display: str, display_num: int
@@ -447,8 +466,7 @@ class XvfbManager:
         """
         held: list[str] = []
         for num in self._unused_numbers():
-            self._cleanup_stale_lock(num)
-            pid = self._holder_pid(num)
+            pid = self._cleanup_stale_lock(num)  # stale を清掃し、生きた持ち主の PID を得る
             if pid is not None:
                 if self._warned_held.get(num) != pid:
                     self._warned_held[num] = pid
@@ -515,7 +533,7 @@ class XvfbManager:
         """
         return holder == spawned_pid or self._parent_pid(holder) == spawned_pid
 
-    def _cleanup_stale_lock(self, display_num: int) -> None:
+    def _cleanup_stale_lock(self, display_num: int) -> int | None:
         """stale なロックファイルを検出・削除する.
 
         SIGKILL で Xvfb が終了した場合、ロックファイルが残留する。
@@ -524,17 +542,21 @@ class XvfbManager:
 
         Args:
             display_num: ディスプレイ番号
+
+        Returns:
+            ロックを握る生きた Xvfb の PID。握られていなければ None
         """
         lock_file = f"{self._LOCK_DIR}/.X{display_num}-lock"
         socket_file = f"{self._SOCKET_DIR}/X{display_num}"
 
         if not os.path.exists(lock_file):
-            return
+            return None
 
-        if self._holder_pid(display_num) is not None:
+        holder = self._holder_pid(display_num)
+        if holder is not None:
             # 生きている → 実際に使用中（警告は _next_display_num が持ち主ごとに一度出す）
             logger.debug("Display :%d is in use, skipping lock cleanup", display_num)
-            return
+            return holder
 
         logger.warning("Cleaning stale lock for display :%d", display_num)
         for f in [lock_file, socket_file]:
@@ -542,6 +564,7 @@ class XvfbManager:
                 os.unlink(f)
             except FileNotFoundError:
                 pass
+        return None
 
     async def _stop_process(
         self,

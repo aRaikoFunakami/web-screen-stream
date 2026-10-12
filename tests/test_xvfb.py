@@ -597,3 +597,64 @@ class TestReleaseWindow:
             await manager.release(":100")
 
         assert manager._pending == set()
+
+
+class TestReleaseEdgeCases:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("display", [":100", "bogus", ""])
+    async def test_release_of_unregistered_display_only_warns(
+        self, manager, display, caplog
+    ):
+        """未登録（不正な文字列を含む）の display は警告して返るだけで、例外にしない."""
+        with caplog.at_level("WARNING", logger=xvfb_module.logger.name):
+            await manager.release(display)
+
+        assert any("not found in managed displays" in r.getMessage() for r in caplog.records)
+        assert manager._pending == set()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_release_still_stops_xvfb_and_clears_pending(
+        self, manager, mock_focus_relay
+    ):
+        """呼び出し側がキャンセルされても、Xvfb の停止と pending の解除は最後まで行う."""
+        procs = iter([make_fake_proc(90070), make_fake_proc(90170)])
+        with patch.object(
+            asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=lambda *a, **k: next(procs)),
+        ), fluxbox_open(manager):
+            await manager.allocate(1280, 720)
+
+        entered, gate = asyncio.Event(), asyncio.Event()
+        stopped = []
+
+        async def slow_stop(proc, name, display):
+            if name == "Fluxbox":
+                entered.set()
+                await gate.wait()
+            stopped.append(name)
+
+        manager._stop_process = slow_stop
+        release = asyncio.create_task(manager.release(":100"))
+        await asyncio.wait_for(entered.wait(), 1)
+
+        release.cancel()  # 呼び出し側がキャンセルされる
+        with pytest.raises(asyncio.CancelledError):
+            await release
+        assert manager._pending == {100}  # 停止はまだ続いている → 孤児扱いにしない
+
+        gate.set()
+        await asyncio.gather(*manager._release_tasks)
+
+        assert stopped == ["Fluxbox", "Xvfb"]
+        assert manager._pending == set()
+        assert manager._release_tasks == set()
+
+    def test_cleanup_returns_live_holder_and_none_otherwise(self, manager):
+        assert manager._cleanup_stale_lock(100) is None  # ロック無し
+        put_lock(manager, 100, 777)
+        assert manager._cleanup_stale_lock(100) == 777  # 生きた Xvfb
+        assert os.path.exists(f"{manager._LOCK_DIR}/.X100-lock")
+        put_lock(manager, 101, 778, comm="python")  # 再利用された PID
+        assert manager._cleanup_stale_lock(101) is None
+        assert not os.path.exists(f"{manager._LOCK_DIR}/.X101-lock")
