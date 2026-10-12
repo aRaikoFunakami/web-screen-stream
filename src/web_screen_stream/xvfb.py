@@ -101,6 +101,11 @@ class XvfbManager:
     # プロセス停止タイムアウト
     _STOP_TIMEOUT = 3.0
 
+    # X のロック/ソケットと /proc の場所（テストで差し替える）
+    _LOCK_DIR = "/tmp"
+    _SOCKET_DIR = "/tmp/.X11-unix"
+    _PROC_DIR = "/proc"
+
     def __init__(
         self,
         base_display: int = 100,
@@ -119,6 +124,8 @@ class XvfbManager:
         self._depth = screen_depth
         self._displays: dict[str, DisplayInfo] = {}
         self._lock = asyncio.Lock()
+        # 他プロセスに握られていると警告済みの番号（確保のたびに同じ警告を出さない）
+        self._warned_held: set[int] = set()
 
     async def allocate(self, width: int = 1280, height: int = 720) -> str:
         """新しいディスプレイを割り当て、Xvfb + Fluxbox を起動する.
@@ -191,7 +198,8 @@ class XvfbManager:
                     break
 
             if not started:
-                # タイムアウト → Xvfb 起動失敗、クリーンアップ
+                # 起動失敗（タイムアウト・自分の Xvfb の早期終了・他者がロックを保持）、
+                # クリーンアップ
                 logger.error(failure)
                 if xvfb_proc.returncode is None:
                     await self._kill_process(xvfb_proc)
@@ -356,89 +364,114 @@ class XvfbManager:
 
     @property
     def available_count(self) -> int:
-        """残り利用可能なディスプレイ数."""
-        return self._max - len(self._displays)
+        """残り利用可能なディスプレイ数（他プロセスが握る番号は数えない）."""
+        return sum(1 for num in self._unused_numbers() if not self._is_held(num))
 
     @property
     def max_displays(self) -> int:
         """最大同時ディスプレイ数."""
         return self._max
 
+    def _unused_numbers(self) -> list[int]:
+        """この manager が登録していない範囲内の番号."""
+        used = {int(d.lstrip(":")) for d in self._displays}
+        return [n for n in range(self._base, self._base + self._max) if n not in used]
+
     def _next_display_num(self) -> int:
-        """未使用のディスプレイ番号を返す.
+        """未使用で、他のプロセスにも握られていないディスプレイ番号を返す.
+
+        stale なロックはここで清掃する。生きた Xvfb（前の backend の孤児等）が
+        握る番号は飛ばす。
 
         Returns:
             ディスプレイ番号
 
         Raises:
-            RuntimeError: 空きがない場合
+            RuntimeError: 空きがない場合。他プロセスが握る番号で埋まっている場合も
+                "Maximum displays reached" で始まる（呼び出し側が容量不足として扱える）
         """
-        used = {int(d.lstrip(":")) for d in self._displays}
         held: list[str] = []
-        for num in range(self._base, self._base + self._max):
-            if num in used:
-                continue
+        for num in self._unused_numbers():
             self._cleanup_stale_lock(num)
-            holder = self._read_lock_pid(num)
-            if holder is not None:
-                # 管理外の生きた Xvfb（前の backend の孤児等）が握っている番号は使わない
-                logger.warning(
-                    "Display :%d is held by another process (PID=%d), skipping",
-                    num,
-                    holder,
-                )
+            if self._is_held(num):
+                if num not in self._warned_held:
+                    self._warned_held.add(num)
+                    logger.warning(
+                        "Display :%d is held by another Xvfb (PID=%s), skipping",
+                        num,
+                        self._read_lock_pid(num),
+                    )
                 held.append(f":{num}")
                 continue
+            self._warned_held.discard(num)
             return num
         if held:
             raise RuntimeError(
-                f"No available display numbers (held by other processes: {', '.join(held)})"
+                f"Maximum displays reached ({self._max}); "
+                f"held by other processes: {', '.join(held)}. "
+                f"Stop an existing session first."
             )
         raise RuntimeError("No available display numbers")
 
     def _read_lock_pid(self, display_num: int) -> int | None:
         """ロックファイルの持ち主 PID を返す. ロックが無い・読めない場合は None."""
         try:
-            with open(f"/tmp/.X{display_num}-lock") as f:
+            with open(f"{self._LOCK_DIR}/.X{display_num}-lock") as f:
                 return int(f.read().strip())
-        except (FileNotFoundError, ValueError, OSError):
+        except (ValueError, OSError):
             return None
+
+    def _is_xvfb_alive(self, pid: int) -> bool:
+        """PID が生きた Xvfb か. PID が別のプロセスに再利用されていれば False.
+
+        /proc が無い環境（macOS 開発機等）では生存確認だけで判断する。
+        """
+        try:
+            with open(f"{self._PROC_DIR}/{pid}/comm") as f:
+                return f.read().strip().startswith("Xvfb")
+        except OSError:
+            if os.path.isdir(self._PROC_DIR):
+                return False  # プロセスが存在しない
+        try:
+            os.kill(pid, 0)  # シグナルは送らない
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _is_held(self, display_num: int) -> bool:
+        """生きた Xvfb がその番号のロックを握っているか."""
+        pid = self._read_lock_pid(display_num)
+        return pid is not None and self._is_xvfb_alive(pid)
 
     def _cleanup_stale_lock(self, display_num: int) -> None:
         """stale なロックファイルを検出・削除する.
 
         SIGKILL で Xvfb が終了した場合、ロックファイルが残留する。
-        PID を確認し、プロセスが存在しなければ削除する。
+        持ち主の PID が生きた Xvfb でなければ（終了済み・別プロセスに再利用済み・
+        読み取り不能）削除する。
 
         Args:
             display_num: ディスプレイ番号
         """
-        lock_file = f"/tmp/.X{display_num}-lock"
-        socket_file = f"/tmp/.X11-unix/X{display_num}"
+        lock_file = f"{self._LOCK_DIR}/.X{display_num}-lock"
+        socket_file = f"{self._SOCKET_DIR}/X{display_num}"
 
         if not os.path.exists(lock_file):
             return
 
-        try:
-            with open(lock_file) as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 0)  # プロセス存在確認（シグナルは送らない）
-            # プロセスが生きている → 実際に使用中
-            logger.warning(
-                "Display :%d lock exists and PID %d is alive, skipping cleanup",
-                display_num,
-                pid,
-            )
-        except (ProcessLookupError, ValueError, PermissionError):
-            # プロセスが存在しない or PID 読み取り失敗 → stale
-            logger.warning(
-                "Cleaning stale lock for display :%d", display_num
-            )
-            for f in [lock_file, socket_file]:
-                try:
-                    os.unlink(f)
-                except FileNotFoundError:
-                    pass
+        if self._is_held(display_num):
+            # 生きている → 実際に使用中（警告は _next_display_num が番号ごとに一度出す）
+            logger.debug("Display :%d is in use, skipping lock cleanup", display_num)
+            return
+
+        logger.warning("Cleaning stale lock for display :%d", display_num)
+        for f in [lock_file, socket_file]:
+            try:
+                os.unlink(f)
+            except FileNotFoundError:
+                pass
 
     async def _stop_process(
         self,
