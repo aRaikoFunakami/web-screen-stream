@@ -75,12 +75,17 @@ class DisplaysHeldError(RuntimeError):
     """
 
     def __init__(self, max_displays: int, held: list[str]):
+        self.max_displays = max_displays
         self.held = held
         super().__init__(
             f"Maximum displays reached ({max_displays}); "
             f"held by other processes: {', '.join(held)}. "
             f"Stop an existing session first."
         )
+
+    def __reduce__(self):
+        # 既定の復元は args（メッセージだけ）で __init__ を呼び、TypeError になる
+        return (type(self), (self.max_displays, self.held))
 
 
 @dataclass
@@ -368,8 +373,14 @@ class XvfbManager:
         # 最後まで行う（途中で止まると、生きた自分の Xvfb が孤児扱いで残る）。
         task = asyncio.ensure_future(self._finish_release(info, display, display_num))
         self._release_tasks.add(task)
-        task.add_done_callback(self._on_release_done)
-        await asyncio.shield(task)
+        task.add_done_callback(self._release_tasks.discard)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # 呼び出し側は結果を受け取れない。失敗しても誰にも伝わらないので、ここでだけログに残す
+            # （呼び出し側が待っている場合は例外がそのまま届くので、二重にログしない）。
+            task.add_done_callback(self._log_release_failure)
+            raise
 
     async def _finish_release(
         self, info: DisplayInfo, display: str, display_num: int
@@ -380,10 +391,9 @@ class XvfbManager:
         finally:
             self._pending.discard(display_num)
 
-    def _on_release_done(self, task: "asyncio.Future[None]") -> None:
-        self._release_tasks.discard(task)
+    @staticmethod
+    def _log_release_failure(task: "asyncio.Future[None]") -> None:
         if not task.cancelled() and task.exception() is not None:
-            # 呼び出し側がキャンセル済みで結果を受け取れない場合に備え、ログに残す
             logger.error("Display release failed", exc_info=task.exception())
 
     async def _stop_display(

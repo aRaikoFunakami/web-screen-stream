@@ -9,7 +9,9 @@ https://github.com/aRaikoFunakami/web-screen-stream/issues/6)
 """
 
 import asyncio
+import copy
 import os
+import pickle
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
@@ -658,3 +660,74 @@ class TestReleaseEdgeCases:
         put_lock(manager, 101, 778, comm="python")  # 再利用された PID
         assert manager._cleanup_stale_lock(101) is None
         assert not os.path.exists(f"{manager._LOCK_DIR}/.X101-lock")
+
+
+class TestReleaseFailureLogging:
+    @pytest.fixture
+    async def allocated(self, manager, mock_focus_relay):
+        procs = iter([make_fake_proc(90080), make_fake_proc(90180)])
+        with patch.object(
+            asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=lambda *a, **k: next(procs)),
+        ), fluxbox_open(manager):
+            await manager.allocate(1280, 720)
+        return manager
+
+    @staticmethod
+    def failures(caplog):
+        return [r for r in caplog.records if r.getMessage() == "Display release failed"]
+
+    @pytest.mark.asyncio
+    async def test_failure_with_waiting_caller_is_raised_not_logged_twice(
+        self, allocated, caplog
+    ):
+        async def boom(proc, name, display):
+            raise RuntimeError("stop failed")
+
+        allocated._stop_process = boom
+        with caplog.at_level("ERROR", logger=xvfb_module.logger.name):
+            with pytest.raises(RuntimeError, match="stop failed"):
+                await allocated.release(":100")
+            await asyncio.sleep(0)
+
+        assert self.failures(caplog) == []  # 例外は呼び出し側に届くのでログしない
+        assert allocated._release_tasks == set()
+        assert allocated._pending == set()
+
+    @pytest.mark.asyncio
+    async def test_failure_after_caller_cancelled_is_logged_and_cleaned_up(
+        self, allocated, caplog
+    ):
+        entered, gate = asyncio.Event(), asyncio.Event()
+
+        async def slow_boom(proc, name, display):
+            entered.set()
+            await gate.wait()
+            raise RuntimeError("stop failed")
+
+        allocated._stop_process = slow_boom
+        with caplog.at_level("ERROR", logger=xvfb_module.logger.name):
+            release = asyncio.create_task(allocated.release(":100"))
+            await asyncio.wait_for(entered.wait(), 1)
+            release.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await release
+
+            gate.set()
+            await asyncio.gather(*allocated._release_tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+
+        assert len(self.failures(caplog)) == 1  # 受け取り手が居ないのでここでだけ記録
+        assert allocated._release_tasks == set()
+        assert allocated._pending == set()
+
+
+class TestDisplaysHeldErrorRoundTrip:
+    def test_pickle_and_copy_keep_fields_and_message(self):
+        err = DisplaysHeldError(3, [":100", ":101"])
+        for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err)):
+            assert isinstance(clone, DisplaysHeldError)
+            assert clone.held == [":100", ":101"]
+            assert clone.max_displays == 3
+            assert str(clone) == str(err)
