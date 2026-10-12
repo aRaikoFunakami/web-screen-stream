@@ -66,6 +66,23 @@ def check_display(display: str | None = None) -> bool:
 # ============================================================
 
 
+class DisplaysHeldError(RuntimeError):
+    """空き番号が、他のプロセス（前の backend の孤児 Xvfb 等）に握られた分だけ足りない.
+
+    メッセージは容量不足と同じ "Maximum displays reached" で始まる。待っても解放
+    されないので、呼び出し側は isinstance で通常の容量不足と区別できる。
+    `held` は握られている display（例: [":100"]）。
+    """
+
+    def __init__(self, max_displays: int, held: list[str]):
+        self.held = held
+        super().__init__(
+            f"Maximum displays reached ({max_displays}); "
+            f"held by other processes: {', '.join(held)}. "
+            f"Stop an existing session first."
+        )
+
+
 @dataclass
 class DisplayInfo:
     """割り当て済みディスプレイの管理情報."""
@@ -124,8 +141,11 @@ class XvfbManager:
         self._depth = screen_depth
         self._displays: dict[str, DisplayInfo] = {}
         self._lock = asyncio.Lock()
-        # 他プロセスに握られていると警告済みの番号（確保のたびに同じ警告を出さない）
-        self._warned_held: set[int] = set()
+        # 他プロセスに握られていると警告済みの番号 → 持ち主 PID
+        # （確保のたびに同じ警告を出さない。持ち主が変われば再度警告する）
+        self._warned_held: dict[int, int] = {}
+        # 確保の途中（Xvfb 起動済み・未登録）の番号。他者が握る番号と区別して使用中扱いにする
+        self._pending: set[int] = set()
 
     async def allocate(self, width: int = 1280, height: int = 720) -> str:
         """新しいディスプレイを割り当て、Xvfb + Fluxbox を起動する.
@@ -150,169 +170,179 @@ class XvfbManager:
             # 1. 未使用かつ他の Xvfb に握られていない番号を選ぶ
             #    （stale ロックの清掃も _next_display_num が行う）
             display_num = self._next_display_num()
-            display = f":{display_num}"
+            self._pending.add(display_num)
+            try:
+                return await self._start_display(display_num, width, height)
+            finally:
+                self._pending.discard(display_num)
 
-            # 2. Xvfb 起動（プロセスグループリーダーとして）
-            xvfb_proc = await asyncio.create_subprocess_exec(
-                "Xvfb",
+    async def _start_display(self, display_num: int, width: int, height: int) -> str:
+        """選んだ番号で Xvfb + Fluxbox を起動して登録する（self._lock を保持して呼ぶ）."""
+        display = f":{display_num}"
+
+        # 2. Xvfb 起動（プロセスグループリーダーとして）
+        xvfb_proc = await asyncio.create_subprocess_exec(
+            "Xvfb",
+            display,
+            "-screen",
+            "0",
+            f"{width}x{height}x{self._depth}",
+            "-ac",
+            "+extension",
+            "GLX",
+            "+render",
+            "-noreset",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        # 3. Xvfb 起動確認（ポーリング）
+        started = False
+        failure = f"Xvfb failed to start on {display}"
+        for _ in range(self._POLL_MAX_ATTEMPTS):
+            await asyncio.sleep(self._POLL_INTERVAL)
+            if xvfb_proc.returncode is not None:
+                # 自分の Xvfb が即死している（同じ display に別の Xvfb が居る等）。
+                # check_display は相手に繋がって成功してしまうので、成功扱いにしない。
+                failure = (
+                    f"Xvfb exited early on {display} "
+                    f"(returncode={xvfb_proc.returncode}); "
+                    f"display may be held by another Xvfb"
+                )
+                break
+            if check_display(display):
+                # 応答したのが自分の Xvfb とは限らない（起動確認が早すぎると
+                # 即死前の自分ではなく、先に居た Xvfb に繋がる）。ロックの
+                # 持ち主が自分であることで確かめる。
+                holder = self._read_lock_pid(display_num)
+                if holder is not None and not self._is_own_process(
+                    holder, xvfb_proc.pid
+                ):
+                    failure = (
+                        f"Xvfb on {display} is held by another process "
+                        f"(PID={holder}, ours={xvfb_proc.pid})"
+                    )
+                    break
+                started = True
+                break
+
+        if not started:
+            # 起動失敗（タイムアウト・自分の Xvfb の早期終了・他者がロックを保持）、
+            # クリーンアップ
+            logger.error(failure)
+            if xvfb_proc.returncode is None:
+                await self._kill_process(xvfb_proc)
+            self._cleanup_stale_lock(display_num)
+            raise RuntimeError(failure)
+
+        logger.info(
+            "Xvfb started on %s (%dx%d, PID=%d)",
+            display,
+            width,
+            height,
+            xvfb_proc.pid,
+        )
+
+        # 4-8: Fluxbox 設定 + 起動 + FocusRelay 起動。
+        # 失敗時は起動済みリソースを逆順で後始末してから再送出する
+        # （途中失敗で Xvfb だけがリークするのを防ぐ）。
+        fluxbox_proc: asyncio.subprocess.Process | None = None
+        try:
+            # 4. Fluxbox 設定: init + apps を書き込み
+            #    init: グローバル設定（デコレーション無効、ツールバー非表示）
+            #    apps: Chromium クラスのウィンドウにのみ EWMH fullscreen を強制
+            #    （smartestiroid-ui#335）。[Maximized] は装飾除去とサイズ一致のみで
+            #    Chromium 自身の chrome UI（タブバー・URL バー）は消えない。
+            #    [Fullscreen] は _NET_WM_STATE_FULLSCREEN を立てる:
+            #    - window.open() ポップアップ等の追加ウィンドウは、これを検知した
+            #      Chromium が chrome UI を自ら非表示にする（F11 相当、実測確認済み）
+            #    - Playwright launch() 経由の初回ウィンドウはこの通知に反応しない
+            #      ため、呼び出し側で CDP Browser.setWindowBounds
+            #      {windowState: fullscreen} を併用すること（実測確認済み）
+            #    ルールを (name=.*) の全窓一致にしないのは、Fluxbox 自身が出す
+            #    xmessage 等のダイアログまで fullscreen 化され録画を覆うため（実測）。
+            #    apps ファイルの内容は focus_relay.render_fluxbox_apps_config()
+            #    が唯一の生成元（統合テストもここを経由し、対象スコープの
+            #    ドリフトを防ぐ）。
+            fluxbox_home = "/root"
+            fluxbox_dir = os.path.join(fluxbox_home, ".fluxbox")
+            os.makedirs(fluxbox_dir, exist_ok=True)
+
+            init_path = os.path.join(fluxbox_dir, "init")
+            with open(init_path, "w") as f:
+                f.write(
+                    "session.screen0.defaultDeco: NONE\n"
+                    "session.screen0.toolbar.visible: false\n"
+                    "session.screen0.focusModel: ClickFocus\n"
+                    "session.screen0.maxDisableMove: true\n"
+                    "session.screen0.maxDisableResize: true\n"
+                )
+
+            apps_path = os.path.join(fluxbox_dir, "apps")
+            with open(apps_path, "w") as f:
+                f.write(render_fluxbox_apps_config())
+
+            logger.info(
+                "Fluxbox config written: init=%s, apps=%s",
+                init_path,
+                apps_path,
+            )
+
+            # 5. Fluxbox 起動（Xvfb の display を指定）
+            fluxbox_proc = await asyncio.create_subprocess_exec(
+                "fluxbox",
+                "-display",
                 display,
-                "-screen",
-                "0",
-                f"{width}x{height}x{self._depth}",
-                "-ac",
-                "+extension",
-                "GLX",
-                "+render",
-                "-noreset",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                env={**os.environ, "DISPLAY": display, "HOME": fluxbox_home},
                 start_new_session=True,
             )
 
-            # 3. Xvfb 起動確認（ポーリング）
-            started = False
-            failure = f"Xvfb failed to start on {display}"
-            for _ in range(self._POLL_MAX_ATTEMPTS):
-                await asyncio.sleep(self._POLL_INTERVAL)
-                if xvfb_proc.returncode is not None:
-                    # 自分の Xvfb が即死している（同じ display に別の Xvfb が居る等）。
-                    # check_display は相手に繋がって成功してしまうので、成功扱いにしない。
-                    failure = (
-                        f"Xvfb exited early on {display} "
-                        f"(returncode={xvfb_proc.returncode}); "
-                        f"display may be held by another Xvfb"
-                    )
-                    break
-                if check_display(display):
-                    # 応答したのが自分の Xvfb とは限らない（起動確認が早すぎると
-                    # 即死前の自分ではなく、先に居た Xvfb に繋がる）。ロックの
-                    # 持ち主が自分であることで確かめる。
-                    holder = self._read_lock_pid(display_num)
-                    if holder is not None and holder != xvfb_proc.pid:
-                        failure = (
-                            f"Xvfb on {display} is held by another process "
-                            f"(PID={holder}, ours={xvfb_proc.pid})"
-                        )
-                        break
-                    started = True
-                    break
-
-            if not started:
-                # 起動失敗（タイムアウト・自分の Xvfb の早期終了・他者がロックを保持）、
-                # クリーンアップ
-                logger.error(failure)
-                if xvfb_proc.returncode is None:
-                    await self._kill_process(xvfb_proc)
-                self._cleanup_stale_lock(display_num)
-                raise RuntimeError(failure)
-
+            # 6. Fluxbox 起動待ち
+            await asyncio.sleep(self._FLUXBOX_WAIT)
             logger.info(
-                "Xvfb started on %s (%dx%d, PID=%d)",
-                display,
-                width,
-                height,
-                xvfb_proc.pid,
+                "Fluxbox started on %s (PID=%d)", display, fluxbox_proc.pid
             )
 
-            # 4-8: Fluxbox 設定 + 起動 + FocusRelay 起動。
-            # 失敗時は起動済みリソースを逆順で後始末してから再送出する
-            # （途中失敗で Xvfb だけがリークするのを防ぐ）。
-            fluxbox_proc: asyncio.subprocess.Process | None = None
+            # 7. FocusRelay 起動（smartestiroid-ui/web-screen-stream#2）
+            #    Fluxbox の focus-stealing 防止から、複数ウィンドウ切替時の
+            #    前面化を救済する。接続失敗は non-fatal（ログのみ）:
+            #    単一ウィンドウ・多数タブのケースには影響させない。
+            focus_relay: FocusRelay | None = FocusRelay(display)
             try:
-                # 4. Fluxbox 設定: init + apps を書き込み
-                #    init: グローバル設定（デコレーション無効、ツールバー非表示）
-                #    apps: Chromium クラスのウィンドウにのみ EWMH fullscreen を強制
-                #    （smartestiroid-ui#335）。[Maximized] は装飾除去とサイズ一致のみで
-                #    Chromium 自身の chrome UI（タブバー・URL バー）は消えない。
-                #    [Fullscreen] は _NET_WM_STATE_FULLSCREEN を立てる:
-                #    - window.open() ポップアップ等の追加ウィンドウは、これを検知した
-                #      Chromium が chrome UI を自ら非表示にする（F11 相当、実測確認済み）
-                #    - Playwright launch() 経由の初回ウィンドウはこの通知に反応しない
-                #      ため、呼び出し側で CDP Browser.setWindowBounds
-                #      {windowState: fullscreen} を併用すること（実測確認済み）
-                #    ルールを (name=.*) の全窓一致にしないのは、Fluxbox 自身が出す
-                #    xmessage 等のダイアログまで fullscreen 化され録画を覆うため（実測）。
-                #    apps ファイルの内容は focus_relay.render_fluxbox_apps_config()
-                #    が唯一の生成元（統合テストもここを経由し、対象スコープの
-                #    ドリフトを防ぐ）。
-                fluxbox_home = "/root"
-                fluxbox_dir = os.path.join(fluxbox_home, ".fluxbox")
-                os.makedirs(fluxbox_dir, exist_ok=True)
-
-                init_path = os.path.join(fluxbox_dir, "init")
-                with open(init_path, "w") as f:
-                    f.write(
-                        "session.screen0.defaultDeco: NONE\n"
-                        "session.screen0.toolbar.visible: false\n"
-                        "session.screen0.focusModel: ClickFocus\n"
-                        "session.screen0.maxDisableMove: true\n"
-                        "session.screen0.maxDisableResize: true\n"
-                    )
-
-                apps_path = os.path.join(fluxbox_dir, "apps")
-                with open(apps_path, "w") as f:
-                    f.write(render_fluxbox_apps_config())
-
-                logger.info(
-                    "Fluxbox config written: init=%s, apps=%s",
-                    init_path,
-                    apps_path,
-                )
-
-                # 5. Fluxbox 起動（Xvfb の display を指定）
-                fluxbox_proc = await asyncio.create_subprocess_exec(
-                    "fluxbox",
-                    "-display",
-                    display,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    env={**os.environ, "DISPLAY": display, "HOME": fluxbox_home},
-                    start_new_session=True,
-                )
-
-                # 6. Fluxbox 起動待ち
-                await asyncio.sleep(self._FLUXBOX_WAIT)
-                logger.info(
-                    "Fluxbox started on %s (PID=%d)", display, fluxbox_proc.pid
-                )
-
-                # 7. FocusRelay 起動（smartestiroid-ui/web-screen-stream#2）
-                #    Fluxbox の focus-stealing 防止から、複数ウィンドウ切替時の
-                #    前面化を救済する。接続失敗は non-fatal（ログのみ）:
-                #    単一ウィンドウ・多数タブのケースには影響させない。
-                focus_relay: FocusRelay | None = FocusRelay(display)
-                try:
-                    await focus_relay.start()
-                except Exception:
-                    logger.exception(
-                        "FocusRelay failed to start on %s, continuing without it",
-                        display,
-                    )
-                    # start() が部分的に成功した場合（X 接続は確立済み）に
-                    # 備え、確実に閉じてから参照を破棄する（fd リーク防止）。
-                    await focus_relay.stop()
-                    focus_relay = None
+                await focus_relay.start()
             except Exception:
                 logger.exception(
-                    "Fluxbox/FocusRelay setup failed on %s, cleaning up", display
+                    "FocusRelay failed to start on %s, continuing without it",
+                    display,
                 )
-                if fluxbox_proc is not None:
-                    await self._kill_process(fluxbox_proc)
-                await self._kill_process(xvfb_proc)
-                self._cleanup_stale_lock(display_num)
-                raise
-
-            # 8. 管理テーブルに登録
-            info = DisplayInfo(
-                display=display,
-                xvfb_proc=xvfb_proc,
-                fluxbox_proc=fluxbox_proc,
-                width=width,
-                height=height,
-                focus_relay=focus_relay,
+                # start() が部分的に成功した場合（X 接続は確立済み）に
+                # 備え、確実に閉じてから参照を破棄する（fd リーク防止）。
+                await focus_relay.stop()
+                focus_relay = None
+        except Exception:
+            logger.exception(
+                "Fluxbox/FocusRelay setup failed on %s, cleaning up", display
             )
-            self._displays[display] = info
-            return display
+            if fluxbox_proc is not None:
+                await self._kill_process(fluxbox_proc)
+            await self._kill_process(xvfb_proc)
+            self._cleanup_stale_lock(display_num)
+            raise
+
+        # 8. 管理テーブルに登録
+        info = DisplayInfo(
+            display=display,
+            xvfb_proc=xvfb_proc,
+            fluxbox_proc=fluxbox_proc,
+            width=width,
+            height=height,
+            focus_relay=focus_relay,
+        )
+        self._displays[display] = info
+        return display
 
     async def release(self, display: str) -> None:
         """ディスプレイを解放し、Xvfb + Fluxbox プロセスを停止する.
@@ -365,7 +395,17 @@ class XvfbManager:
     @property
     def available_count(self) -> int:
         """残り利用可能なディスプレイ数（他プロセスが握る番号は数えない）."""
-        return sum(1 for num in self._unused_numbers() if not self._is_held(num))
+        return sum(1 for num in self._unused_numbers() if self._holder_pid(num) is None)
+
+    @property
+    def held_displays(self) -> list[str]:
+        """この manager の管理外の生きた Xvfb が握っている display（例: [":100"]）."""
+        return [f":{n}" for n in self._unused_numbers() if self._holder_pid(n) is not None]
+
+    @property
+    def held_count(self) -> int:
+        """他プロセスに握られているディスプレイ数."""
+        return len(self.held_displays)
 
     @property
     def max_displays(self) -> int:
@@ -373,8 +413,8 @@ class XvfbManager:
         return self._max
 
     def _unused_numbers(self) -> list[int]:
-        """この manager が登録していない範囲内の番号."""
-        used = {int(d.lstrip(":")) for d in self._displays}
+        """範囲内で、この manager が登録も確保中にもしていない番号."""
+        used = {int(d.lstrip(":")) for d in self._displays} | self._pending
         return [n for n in range(self._base, self._base + self._max) if n not in used]
 
     def _next_display_num(self) -> int:
@@ -387,30 +427,26 @@ class XvfbManager:
             ディスプレイ番号
 
         Raises:
-            RuntimeError: 空きがない場合。他プロセスが握る番号で埋まっている場合も
-                "Maximum displays reached" で始まる（呼び出し側が容量不足として扱える）
+            DisplaysHeldError: 空きが、他プロセスに握られた番号だけになった場合
+                （"Maximum displays reached" で始まる RuntimeError のサブクラス）
+            RuntimeError: 空きがない場合
         """
         held: list[str] = []
         for num in self._unused_numbers():
             self._cleanup_stale_lock(num)
-            if self._is_held(num):
-                if num not in self._warned_held:
-                    self._warned_held.add(num)
+            pid = self._holder_pid(num)
+            if pid is not None:
+                if self._warned_held.get(num) != pid:
+                    self._warned_held[num] = pid
                     logger.warning(
-                        "Display :%d is held by another Xvfb (PID=%s), skipping",
-                        num,
-                        self._read_lock_pid(num),
+                        "Display :%d is held by another Xvfb (PID=%d), skipping", num, pid
                     )
                 held.append(f":{num}")
                 continue
-            self._warned_held.discard(num)
+            self._warned_held.pop(num, None)
             return num
         if held:
-            raise RuntimeError(
-                f"Maximum displays reached ({self._max}); "
-                f"held by other processes: {', '.join(held)}. "
-                f"Stop an existing session first."
-            )
+            raise DisplaysHeldError(self._max, held)
         raise RuntimeError("No available display numbers")
 
     def _read_lock_pid(self, display_num: int) -> int | None:
@@ -421,17 +457,26 @@ class XvfbManager:
         except (ValueError, OSError):
             return None
 
+    def _holder_pid(self, display_num: int) -> int | None:
+        """その番号のロックを握る生きた Xvfb の PID. 握られていなければ None."""
+        pid = self._read_lock_pid(display_num)
+        return pid if pid is not None and self._is_xvfb_alive(pid) else None
+
     def _is_xvfb_alive(self, pid: int) -> bool:
         """PID が生きた Xvfb か. PID が別のプロセスに再利用されていれば False.
 
-        /proc が無い環境（macOS 開発機等）では生存確認だけで判断する。
+        /proc が読めない（macOS 開発機等、または権限不足）場合は、名前は確かめられない
+        ので生存確認だけで判断する。読めないことを「プロセスが居ない」とは扱わない
+        （生きた孤児のロックを消さないため）。
         """
         try:
             with open(f"{self._PROC_DIR}/{pid}/comm") as f:
                 return f.read().strip().startswith("Xvfb")
-        except OSError:
+        except FileNotFoundError:
             if os.path.isdir(self._PROC_DIR):
-                return False  # プロセスが存在しない
+                return False  # /proc はあり、そのプロセスだけが居ない
+        except OSError:
+            pass  # PermissionError 等: 下の生存確認に任せる
         try:
             os.kill(pid, 0)  # シグナルは送らない
         except ProcessLookupError:
@@ -440,10 +485,21 @@ class XvfbManager:
             return True
         return True
 
-    def _is_held(self, display_num: int) -> bool:
-        """生きた Xvfb がその番号のロックを握っているか."""
-        pid = self._read_lock_pid(display_num)
-        return pid is not None and self._is_xvfb_alive(pid)
+    def _parent_pid(self, pid: int) -> int | None:
+        """/proc/<pid>/stat から親 PID を返す. 読めなければ None."""
+        try:
+            with open(f"{self._PROC_DIR}/{pid}/stat") as f:
+                # "pid (comm) S ppid ..." — comm は括弧を含み得るので最後の ')' 以降を読む
+                return int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def _is_own_process(self, holder: int, spawned_pid: int) -> bool:
+        """ロックの持ち主が、自分が起動したプロセスか（またはその子か）.
+
+        Xvfb がラッパー経由で fork する環境でも、子がロックを書いたものとして扱う。
+        """
+        return holder == spawned_pid or self._parent_pid(holder) == spawned_pid
 
     def _cleanup_stale_lock(self, display_num: int) -> None:
         """stale なロックファイルを検出・削除する.
@@ -461,8 +517,8 @@ class XvfbManager:
         if not os.path.exists(lock_file):
             return
 
-        if self._is_held(display_num):
-            # 生きている → 実際に使用中（警告は _next_display_num が番号ごとに一度出す）
+        if self._holder_pid(display_num) is not None:
+            # 生きている → 実際に使用中（警告は _next_display_num が持ち主ごとに一度出す）
             logger.debug("Display :%d is in use, skipping lock cleanup", display_num)
             return
 

@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 import pytest
 
 from web_screen_stream import xvfb as xvfb_module
-from web_screen_stream.xvfb import XvfbManager
+from web_screen_stream.xvfb import DisplaysHeldError, XvfbManager
 
 
 def make_fake_proc(pid: int) -> MagicMock:
@@ -376,3 +376,158 @@ async def test_startup_timeout_kills_the_still_running_xvfb(manager, monkeypatch
 
     assert manager._displays == {}
     xvfb_module.os.killpg.assert_called_once()
+
+
+class TestHeldDisplaysReporting:
+    def test_held_displays_and_count(self, manager):
+        assert manager.held_displays == [] and manager.held_count == 0
+        put_lock(manager, 101, 777)
+        assert manager.held_displays == [":101"]
+        assert manager.held_count == 1
+
+    @pytest.mark.asyncio
+    async def test_all_held_raises_distinguishable_error_with_held_list(self, manager):
+        """待っても解放されない状態は DisplaysHeldError で、通常の容量不足と区別できる."""
+        put_lock(manager, 100, 777)
+        put_lock(manager, 101, 778)
+
+        with pytest.raises(DisplaysHeldError) as exc:
+            await manager.allocate(1280, 720)
+
+        assert exc.value.held == [":100", ":101"]
+        assert isinstance(exc.value, RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_plain_exhaustion_is_not_a_held_error(self, manager, mock_focus_relay):
+        create_mock = AsyncMock(
+            side_effect=[make_fake_proc(p) for p in (90040, 90041, 90042, 90043)]
+        )
+        with patch.object(asyncio, "create_subprocess_exec", create_mock), fluxbox_open(
+            manager
+        ):
+            await manager.allocate()
+            await manager.allocate()
+            with pytest.raises(RuntimeError, match="Maximum displays reached") as exc:
+                await manager.allocate()
+
+        assert not isinstance(exc.value, DisplaysHeldError)
+
+
+class TestInFlightAllocation:
+    @pytest.mark.asyncio
+    async def test_display_being_allocated_is_used_not_held(
+        self, manager, mock_focus_relay
+    ):
+        """確保途中（自分の Xvfb がロックを書いた後・未登録）の番号を『他者が握る』と数えない."""
+        seen = {}
+        procs = iter([make_fake_proc(90020), make_fake_proc(90120)])
+
+        async def spawn(*args, **kwargs):
+            if "num" not in seen:  # 1 回目 = Xvfb。自分のロックができた状態を作る
+                put_lock(manager, 100, 90020)
+                seen["num"] = True
+                seen["available"] = manager.available_count
+                seen["held"] = manager.held_count
+            return next(procs)
+
+        with patch.object(
+            asyncio, "create_subprocess_exec", AsyncMock(side_effect=spawn)
+        ), fluxbox_open(manager):
+            display = await manager.allocate(1280, 720)
+
+        assert display == ":100"
+        assert seen["held"] == 0  # 自分の確保途中を孤児扱いしない
+        assert seen["available"] == 1  # :100 は使用中、:101 だけが空き
+        assert manager.available_count == 1
+
+    @pytest.mark.asyncio
+    async def test_lock_written_by_child_of_spawned_process_is_ours(
+        self, manager, mock_focus_relay
+    ):
+        """Xvfb がラッパー経由で fork しても、子がロックを書いたなら自分のものとして扱う."""
+        procs = iter([make_fake_proc(90030), make_fake_proc(90130)])
+
+        async def spawn(*args, **kwargs):
+            proc = next(procs)
+            if proc.pid == 90030:
+                put_lock(manager, 100, 5001)
+                Path(f"{manager._PROC_DIR}/5001/stat").write_text(
+                    "5001 (Xvfb) S 90030 5001 5001 0 -1\n"
+                )
+            return proc
+
+        with patch.object(
+            asyncio, "create_subprocess_exec", AsyncMock(side_effect=spawn)
+        ), fluxbox_open(manager):
+            display = await manager.allocate(1280, 720)
+
+        assert display == ":100"
+
+
+class TestHeldWarning:
+    def test_warns_again_when_a_different_process_takes_the_display(
+        self, manager, caplog
+    ):
+        def warnings():
+            return [r for r in caplog.records if "held by another Xvfb" in r.getMessage()]
+
+        put_lock(manager, 100, 777)
+        with caplog.at_level("WARNING", logger=xvfb_module.logger.name):
+            manager._next_display_num()
+            manager._next_display_num()
+            assert len(warnings()) == 1  # 同じ持ち主は一度だけ
+
+            put_lock(manager, 100, 888)  # 別の孤児が同じ番号を握った
+            manager._next_display_num()
+            assert len(warnings()) == 2
+
+            os.unlink(f"{manager._LOCK_DIR}/.X100-lock")  # 解放後に再び握られた
+            assert manager._next_display_num() == 100
+            put_lock(manager, 100, 888)
+            manager._next_display_num()
+            assert len(warnings()) == 3
+
+
+class TestIsXvfbAliveFallbacks:
+    def test_unreadable_proc_falls_back_to_liveness_check(self, manager, monkeypatch):
+        """/proc/<pid>/comm が権限で読めないとき、『居ない』とは扱わず生存確認に任せる."""
+        real_open = open
+
+        def deny_proc(path, *args, **kwargs):
+            if str(path).startswith(manager._PROC_DIR):
+                raise PermissionError(13, "denied")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", deny_proc)
+        monkeypatch.setattr(xvfb_module.os, "kill", lambda pid, sig: None)
+        assert manager._is_xvfb_alive(5) is True  # 生きている → 握っている扱い
+
+        def gone(pid, sig):
+            raise ProcessLookupError
+
+        monkeypatch.setattr(xvfb_module.os, "kill", gone)
+        assert manager._is_xvfb_alive(5) is False
+
+    def test_without_proc_dir_uses_kill(self, manager, monkeypatch):
+        """/proc が無い環境（macOS 等）では os.kill(pid, 0) で判断する."""
+        manager._PROC_DIR = str(Path(manager._PROC_DIR) / "does-not-exist")
+        results = {1: None, 2: ProcessLookupError, 3: PermissionError}
+
+        def fake_kill(pid, sig):
+            assert sig == 0  # シグナルは送らない
+            if results[pid] is not None:
+                raise results[pid]
+
+        monkeypatch.setattr(xvfb_module.os, "kill", fake_kill)
+        assert manager._is_xvfb_alive(1) is True
+        assert manager._is_xvfb_alive(2) is False
+        assert manager._is_xvfb_alive(3) is True  # 他ユーザーのプロセス = 生きている
+
+    def test_parent_pid_and_ownership(self, manager):
+        put_lock(manager, 100, 50)
+        Path(f"{manager._PROC_DIR}/50/stat").write_text("50 (a) b)) S 40 50 50 0\n")
+        assert manager._parent_pid(50) == 40  # comm に ')' を含んでも読める
+        assert manager._is_own_process(50, 50) is True
+        assert manager._is_own_process(50, 40) is True
+        assert manager._is_own_process(50, 41) is False
+        assert manager._parent_pid(99999) is None
