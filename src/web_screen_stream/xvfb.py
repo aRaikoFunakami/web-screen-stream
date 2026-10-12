@@ -140,11 +140,10 @@ class XvfbManager:
                     f"Stop an existing session first."
                 )
 
+            # 1. 未使用かつ他の Xvfb に握られていない番号を選ぶ
+            #    （stale ロックの清掃も _next_display_num が行う）
             display_num = self._next_display_num()
             display = f":{display_num}"
-
-            # 1. stale ロックファイルの清掃
-            self._cleanup_stale_lock(display_num)
 
             # 2. Xvfb 起動（プロセスグループリーダーとして）
             xvfb_proc = await asyncio.create_subprocess_exec(
@@ -165,18 +164,39 @@ class XvfbManager:
 
             # 3. Xvfb 起動確認（ポーリング）
             started = False
+            failure = f"Xvfb failed to start on {display}"
             for _ in range(self._POLL_MAX_ATTEMPTS):
                 await asyncio.sleep(self._POLL_INTERVAL)
+                if xvfb_proc.returncode is not None:
+                    # 自分の Xvfb が即死している（同じ display に別の Xvfb が居る等）。
+                    # check_display は相手に繋がって成功してしまうので、成功扱いにしない。
+                    failure = (
+                        f"Xvfb exited early on {display} "
+                        f"(returncode={xvfb_proc.returncode}); "
+                        f"display may be held by another Xvfb"
+                    )
+                    break
                 if check_display(display):
+                    # 応答したのが自分の Xvfb とは限らない（起動確認が早すぎると
+                    # 即死前の自分ではなく、先に居た Xvfb に繋がる）。ロックの
+                    # 持ち主が自分であることで確かめる。
+                    holder = self._read_lock_pid(display_num)
+                    if holder is not None and holder != xvfb_proc.pid:
+                        failure = (
+                            f"Xvfb on {display} is held by another process "
+                            f"(PID={holder}, ours={xvfb_proc.pid})"
+                        )
+                        break
                     started = True
                     break
 
             if not started:
                 # タイムアウト → Xvfb 起動失敗、クリーンアップ
-                logger.error("Xvfb failed to start on %s", display)
-                await self._kill_process(xvfb_proc)
+                logger.error(failure)
+                if xvfb_proc.returncode is None:
+                    await self._kill_process(xvfb_proc)
                 self._cleanup_stale_lock(display_num)
-                raise RuntimeError(f"Xvfb failed to start on {display}")
+                raise RuntimeError(failure)
 
             logger.info(
                 "Xvfb started on %s (%dx%d, PID=%d)",
@@ -354,10 +374,35 @@ class XvfbManager:
             RuntimeError: 空きがない場合
         """
         used = {int(d.lstrip(":")) for d in self._displays}
+        held: list[str] = []
         for num in range(self._base, self._base + self._max):
-            if num not in used:
-                return num
+            if num in used:
+                continue
+            self._cleanup_stale_lock(num)
+            holder = self._read_lock_pid(num)
+            if holder is not None:
+                # 管理外の生きた Xvfb（前の backend の孤児等）が握っている番号は使わない
+                logger.warning(
+                    "Display :%d is held by another process (PID=%d), skipping",
+                    num,
+                    holder,
+                )
+                held.append(f":{num}")
+                continue
+            return num
+        if held:
+            raise RuntimeError(
+                f"No available display numbers (held by other processes: {', '.join(held)})"
+            )
         raise RuntimeError("No available display numbers")
+
+    def _read_lock_pid(self, display_num: int) -> int | None:
+        """ロックファイルの持ち主 PID を返す. ロックが無い・読めない場合は None."""
+        try:
+            with open(f"/tmp/.X{display_num}-lock") as f:
+                return int(f.read().strip())
+        except (FileNotFoundError, ValueError, OSError):
+            return None
 
     def _cleanup_stale_lock(self, display_num: int) -> None:
         """stale なロックファイルを検出・削除する.

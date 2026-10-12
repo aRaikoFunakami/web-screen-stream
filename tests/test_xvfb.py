@@ -33,6 +33,9 @@ def manager(monkeypatch):
     mgr = XvfbManager(base_display=100, max_displays=2)
     mgr._POLL_INTERVAL = 0
     mgr._FLUXBOX_WAIT = 0
+    # 実 /tmp のロック/ソケットを読まない・消さない（既定は「ロック無し」）
+    monkeypatch.setattr(mgr, "_read_lock_pid", lambda n: None)
+    monkeypatch.setattr(mgr, "_cleanup_stale_lock", lambda n: None)
     return mgr
 
 
@@ -200,3 +203,90 @@ class TestReleaseFocusRelayWiring:
 
         fluxbox_proc.wait.assert_awaited()
         xvfb_proc.wait.assert_awaited()
+
+
+
+class TestAllocateWhenDisplayHeldByAnotherXvfb:
+    """同じ display に別の Xvfb が居る場合 (Issue #6)."""
+
+    @pytest.mark.asyncio
+    async def test_early_exit_of_own_xvfb_is_a_failure(self, manager, mock_focus_relay):
+        """自分の Xvfb が即死したら、check_display が相手に繋がって成功しても失敗にする."""
+        dead_xvfb = make_fake_proc(90010)
+        dead_xvfb.returncode = 1  # "Server already active"
+        create_mock = AsyncMock(side_effect=[dead_xvfb])
+
+        with patch.object(asyncio, "create_subprocess_exec", create_mock), patch(
+            "builtins.open", mock_open()
+        ):
+            with pytest.raises(RuntimeError, match="exited early on :100"):
+                await manager.allocate(1280, 720)
+
+        assert manager._displays == {}
+        assert create_mock.await_count == 1  # Fluxbox まで進まない
+        xvfb_module.os.killpg.assert_not_called()  # 死んだ pid へ kill を送らない
+
+    @pytest.mark.asyncio
+    async def test_foreign_lock_holder_after_start_is_a_failure(
+        self, manager, mock_focus_relay, monkeypatch
+    ):
+        """即死の検知が間に合わなくても、ロックの持ち主が自分でなければ失敗にし、自分の Xvfb を止める."""
+        xvfb_proc = make_fake_proc(90011)  # returncode=None（まだ終了を観測していない）
+        calls = iter([None, 777])  # 起動前は無し、起動後は他者(777)が持ち主
+        monkeypatch.setattr(manager, "_read_lock_pid", lambda n: next(calls, 777))
+        create_mock = AsyncMock(side_effect=[xvfb_proc])
+
+        with patch.object(asyncio, "create_subprocess_exec", create_mock):
+            with pytest.raises(RuntimeError, match="held by another process"):
+                await manager.allocate(1280, 720)
+
+        assert manager._displays == {}
+        xvfb_module.os.killpg.assert_called_once()  # 自分の Xvfb は止める
+
+    @pytest.mark.asyncio
+    async def test_held_display_is_skipped_and_next_one_is_used(
+        self, manager, mock_focus_relay, monkeypatch
+    ):
+        """孤児が握る :100 は飛ばし、:101 で確保する（以降の確保が永久に失敗しない）."""
+        monkeypatch.setattr(
+            manager, "_read_lock_pid", lambda n: 777 if n == 100 else None
+        )
+        create_mock = AsyncMock(
+            side_effect=[make_fake_proc(90012), make_fake_proc(90013)]
+        )
+
+        with patch.object(asyncio, "create_subprocess_exec", create_mock), patch(
+            "builtins.open", mock_open()
+        ):
+            display = await manager.allocate(1280, 720)
+
+        assert display == ":101"
+        assert list(manager._displays) == [":101"]
+
+    @pytest.mark.asyncio
+    async def test_all_candidates_held_raises_without_launching(
+        self, manager, monkeypatch
+    ):
+        monkeypatch.setattr(manager, "_read_lock_pid", lambda n: 777)
+        create_mock = AsyncMock()
+
+        with patch.object(asyncio, "create_subprocess_exec", create_mock):
+            with pytest.raises(RuntimeError, match="No available display numbers"):
+                await manager.allocate(1280, 720)
+
+        create_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_timeout_kills_the_still_running_xvfb(manager, monkeypatch):
+    """起動確認がタイムアウトしたら、まだ動いている Xvfb を止めて失敗にする."""
+    monkeypatch.setattr(xvfb_module, "check_display", lambda display=None: False)
+    xvfb_proc = make_fake_proc(90014)  # returncode=None のまま
+    create_mock = AsyncMock(side_effect=[xvfb_proc])
+
+    with patch.object(asyncio, "create_subprocess_exec", create_mock):
+        with pytest.raises(RuntimeError, match="Xvfb failed to start on :100"):
+            await manager.allocate(1280, 720)
+
+    assert manager._displays == {}
+    xvfb_module.os.killpg.assert_called_once()
