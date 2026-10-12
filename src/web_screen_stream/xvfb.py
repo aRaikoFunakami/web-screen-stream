@@ -158,6 +158,8 @@ class XvfbManager:
             display 文字列 (例: ":100")
 
         Raises:
+            DisplaysHeldError: 空きが、他のプロセス（孤児 Xvfb 等）に握られた番号だけに
+                なった場合。待っても解放されない。
             RuntimeError: 最大数に達した場合、または Xvfb 起動失敗
         """
         async with self._lock:
@@ -350,12 +352,25 @@ class XvfbManager:
         Args:
             display: 解放するディスプレイ (例: ":100")
         """
+        display_num = int(display.lstrip(":"))
         async with self._lock:
             info = self._displays.pop(display, None)
             if info is None:
                 logger.warning("Display %s not found in managed displays", display)
                 return
+            # 停止が終わるまでは、自分の Xvfb がまだ生きている。確保途中と同様に
+            # 使用中として数え、他者（孤児）が握る番号と取り違えない。
+            self._pending.add(display_num)
 
+        try:
+            await self._stop_display(info, display, display_num)
+        finally:
+            self._pending.discard(display_num)
+
+    async def _stop_display(
+        self, info: DisplayInfo, display: str, display_num: int
+    ) -> None:
+        """ロック外で FocusRelay → Fluxbox → Xvfb の順に止め、ロックを清掃する."""
         # ロック外で停止（I/O 待ちが長い可能性）
         # 停止順序: FocusRelay → Fluxbox → Xvfb
         # （root ウィンドウが消える前に X 接続を畳んでおく）
@@ -371,7 +386,6 @@ class XvfbManager:
         await self._stop_process(info.xvfb_proc, "Xvfb", display)
 
         # SIGKILL 後のロックファイル清掃
-        display_num = int(display.lstrip(":"))
         self._cleanup_stale_lock(display_num)
 
         logger.info("Display %s released", display)
@@ -394,18 +408,18 @@ class XvfbManager:
 
     @property
     def available_count(self) -> int:
-        """残り利用可能なディスプレイ数（他プロセスが握る番号は数えない）."""
+        """残り利用可能なディスプレイ数（他プロセスが握る番号は数えない）.
+
+        ロックファイルと /proc を読むので、頻繁な呼び出しには向かない。
+        """
         return sum(1 for num in self._unused_numbers() if self._holder_pid(num) is None)
 
-    @property
     def held_displays(self) -> list[str]:
-        """この manager の管理外の生きた Xvfb が握っている display（例: [":100"]）."""
-        return [f":{n}" for n in self._unused_numbers() if self._holder_pid(n) is not None]
+        """この manager の管理外の生きた Xvfb が握っている display（例: [":100"]）.
 
-    @property
-    def held_count(self) -> int:
-        """他プロセスに握られているディスプレイ数."""
-        return len(self.held_displays)
+        ロックファイルと /proc を読む。
+        """
+        return [f":{n}" for n in self._unused_numbers() if self._holder_pid(n) is not None]
 
     @property
     def max_displays(self) -> int:

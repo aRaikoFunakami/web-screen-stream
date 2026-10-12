@@ -1,8 +1,11 @@
-"""XvfbManager と FocusRelay の統合部分のテスト.
+"""XvfbManager のテスト.
 
-Xvfb / Fluxbox / FocusRelay の生成はすべてモックし、実プロセス・実 X 接続
-なしで `allocate()`/`release()` の配線とプロセスリーク耐性を検証する。
-(Issue: https://github.com/aRaikoFunakami/web-screen-stream/issues/2)
+Xvfb / Fluxbox / FocusRelay の生成はモックし、実プロセス・実 X 接続なしで
+`allocate()`/`release()` の配線とプロセスリーク耐性を検証する。ロック/ソケット/proc は
+tmp_path 配下の実ファイルで再現し、他の Xvfb が握る display の扱い（Issue #6）も検証する。
+(Issues:
+https://github.com/aRaikoFunakami/web-screen-stream/issues/2,
+https://github.com/aRaikoFunakami/web-screen-stream/issues/6)
 """
 
 import asyncio
@@ -379,11 +382,10 @@ async def test_startup_timeout_kills_the_still_running_xvfb(manager, monkeypatch
 
 
 class TestHeldDisplaysReporting:
-    def test_held_displays_and_count(self, manager):
-        assert manager.held_displays == [] and manager.held_count == 0
+    def test_held_displays(self, manager):
+        assert manager.held_displays() == []
         put_lock(manager, 101, 777)
-        assert manager.held_displays == [":101"]
-        assert manager.held_count == 1
+        assert manager.held_displays() == [":101"]
 
     @pytest.mark.asyncio
     async def test_all_held_raises_distinguishable_error_with_held_list(self, manager):
@@ -427,7 +429,7 @@ class TestInFlightAllocation:
                 put_lock(manager, 100, 90020)
                 seen["num"] = True
                 seen["available"] = manager.available_count
-                seen["held"] = manager.held_count
+                seen["held"] = len(manager.held_displays())
             return next(procs)
 
         with patch.object(
@@ -531,3 +533,67 @@ class TestIsXvfbAliveFallbacks:
         assert manager._is_own_process(50, 40) is True
         assert manager._is_own_process(50, 41) is False
         assert manager._parent_pid(99999) is None
+
+
+class TestReleaseWindow:
+    @pytest.mark.asyncio
+    async def test_display_being_released_is_not_reported_as_held(
+        self, manager, mock_focus_relay
+    ):
+        """止めている最中の自分の Xvfb（まだ生きていてロックも残る）を孤児扱いしない."""
+        procs = iter([make_fake_proc(90050), make_fake_proc(90150)])
+
+        async def spawn(*args, **kwargs):
+            proc = next(procs)
+            if proc.pid == 90050:
+                put_lock(manager, 100, 90050)
+            return proc
+
+        with patch.object(
+            asyncio, "create_subprocess_exec", AsyncMock(side_effect=spawn)
+        ), fluxbox_open(manager):
+            assert await manager.allocate(1280, 720) == ":100"
+
+        entered, gate = asyncio.Event(), asyncio.Event()
+
+        async def slow_stop(proc, name, display):
+            if name == "Xvfb":
+                entered.set()
+                await gate.wait()
+                # Xvfb が終了した状態にする（proc エントリ消滅）
+                import shutil
+
+                shutil.rmtree(f"{manager._PROC_DIR}/90050")
+
+        manager._stop_process = slow_stop
+        release = asyncio.create_task(manager.release(":100"))
+        await asyncio.wait_for(entered.wait(), 1)
+
+        # 解放の途中: 孤児とは数えず、空きにも数えない
+        assert manager.held_displays() == []
+        assert manager.available_count == 1  # :101 のみ
+        assert manager._next_display_num() == 101
+
+        gate.set()
+        await release
+
+        assert manager._pending == set()
+        assert manager.available_count == 2
+        assert not os.path.exists(f"{manager._LOCK_DIR}/.X100-lock")
+
+    @pytest.mark.asyncio
+    async def test_pending_is_cleared_even_if_stop_fails(self, manager, mock_focus_relay):
+        procs = iter([make_fake_proc(90060), make_fake_proc(90160)])
+        with patch.object(
+            asyncio, "create_subprocess_exec", AsyncMock(side_effect=lambda *a, **k: next(procs))
+        ), fluxbox_open(manager):
+            await manager.allocate(1280, 720)
+
+        async def boom(proc, name, display):
+            raise RuntimeError("stop failed")
+
+        manager._stop_process = boom
+        with pytest.raises(RuntimeError, match="stop failed"):
+            await manager.release(":100")
+
+        assert manager._pending == set()
