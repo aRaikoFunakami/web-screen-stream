@@ -9,7 +9,7 @@ def test_stream_config_defaults():
     assert config.display == ":99"
     assert config.width == 1280
     assert config.height == 720
-    assert config.framerate == 5
+    assert config.framerate == 15
     assert config.bitrate == "500k"
     assert config.gop_size == 10
 
