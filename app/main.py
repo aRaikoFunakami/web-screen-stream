@@ -226,7 +226,7 @@ async def ws_control(websocket: WebSocket, session_id: str):
         first = json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=AUTH_TIMEOUT))
     except WebSocketDisconnect:  # 認証前にクライアントが切った
         return
-    except (asyncio.TimeoutError, json.JSONDecodeError, KeyError):  # KeyError: バイナリフレーム
+    except (asyncio.TimeoutError, json.JSONDecodeError, KeyError, TypeError):  # KeyError/TypeError: バイナリフレーム
         first = None
     token = first.get("token") if isinstance(first, dict) and first.get("type") == "auth" else None
     # 期待値は受信後に引く(待っている間にセッションが作り直されたら、古いトークンでは通さない)
@@ -280,7 +280,7 @@ def _token_ok(session_id: str, token: object) -> bool:
 
 def _bearer_ok(session_id: str, authorization: str | None) -> bool:
     scheme, _, token = (authorization or "").partition(" ")
-    return scheme.lower() == "bearer" and _token_ok(session_id, token)
+    return scheme.lower() == "bearer" and _token_ok(session_id, token.strip())
 
 
 # 認証状態の保存先。共有の /tmp は使わない(他ユーザーの先回り作成・symlink を避ける)

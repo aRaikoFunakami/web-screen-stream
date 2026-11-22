@@ -143,3 +143,24 @@ def test_japanese_reaches_chromium_via_remapped_keycodes(xvfb):
         b.close()
     assert value == "a日本語b漢字かな" + many
     assert after == before  # 何度付け替えても、空きキーコードは全部元に戻る
+
+
+def test_failure_after_partial_typing_reports_typed_count(xvfb):
+    """2 回目以降の付け替えに失敗したら、何文字入力したかを返す(再送で二重入力しないため)."""
+    from web_screen_stream.input import PartialInputError
+    inj = XTestInjector(xvfb, 640, 480)
+    real = inj._load_spares
+    calls = []
+
+    def flaky(*a):
+        calls.append(1)
+        if len(calls) > 1:
+            raise OSError("xkbcomp failed")
+        return real(*a)
+
+    inj._load_spares = flaky
+    text = "".join(chr(c) for c in range(0x3041, 0x3097))  # 空きキーコードより多い種類
+    with pytest.raises(PartialInputError) as e:
+        inj.text(text)
+    inj.close()
+    assert 0 < int(str(e.value).split()[2]) < len(text)

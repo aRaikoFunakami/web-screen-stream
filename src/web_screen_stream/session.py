@@ -540,7 +540,8 @@ class SessionManager:
 
             browser_info = self._browsers.pop(session_id, None)
             chrome_pids = self._browser_pids.pop(session_id, None)
-            controller = self._controllers.pop(session_id, None)
+            with self._control_lock:  # open_control(別スレッド)の予約・確定と排他にする
+                controller = self._controllers.pop(session_id, None)
             display = self._displays.pop(session_id, None)
 
         # ロック外で停止（I/O 待ちが長い可能性）
@@ -605,6 +606,8 @@ class SessionManager:
             raise KeyError(f"Session {session_id} not found")
         reservation = object()  # X への接続中も枠を押さえる(スレッドから呼ばれても二重に通さない)
         with self._control_lock:
+            if self._sessions.get(session_id) is not session:  # 予約の直前に停止された
+                raise KeyError(f"Session {session_id} not found")
             if session_id in self._controllers:
                 raise ControlBusyError(f"Session {session_id} is already being controlled")
             self._controllers[session_id] = reservation
@@ -624,7 +627,8 @@ class SessionManager:
 
         channel = ControlChannel(injector, release)
         with self._control_lock:
-            if self._controllers.get(session_id) is not reservation:  # 接続中にセッションが停止された
+            stopped = self._controllers.get(session_id) is not reservation or self._sessions.get(session_id) is not session
+            if stopped:  # 接続中にセッションが停止された
                 injector.close()
                 raise KeyError(f"Session {session_id} was stopped")
             self._controllers[session_id] = channel

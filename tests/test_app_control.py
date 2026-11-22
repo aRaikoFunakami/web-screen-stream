@@ -2,6 +2,7 @@
 
 import os
 import stat
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -118,6 +119,10 @@ def test_disconnect_right_after_auth_releases_control(client, monkeypatch):
     monkeypatch.setattr(WebSocket, "send_json", send_json)
     with client.websocket_connect("/api/ws/control/s1") as ws:
         ws.send_json({"type": "auth", "token": "right-token"})
+    for _ in range(100):  # サーバ側の後始末(スレッドでの open/close)を待つ。解放されなければ下の接続が 4009 になる
+        if failed and "s1" not in main.session_manager._controllers:
+            break
+        time.sleep(0.02)
     assert failed
     with client.websocket_connect("/api/ws/control/s1") as ws:
         assert _auth(ws) == {"type": "ready"}  # 枠が解放されている

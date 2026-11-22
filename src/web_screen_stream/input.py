@@ -52,6 +52,13 @@ _KEYS = {
 _CONTROL_KEYSYMS = {"\n": XK.XK_Return, "\t": XK.XK_Tab}  # 貼り付けた改行・タブはキーとして押す
 
 
+class PartialInputError(RuntimeError):
+    """文字列の途中で注入に失敗した. 何文字目まで入力したかだけを持つ(内容は持たない)."""
+
+    def __init__(self, typed: int, total: int):
+        super().__init__(f"partial input: {typed} of {total} chars typed")
+
+
 class ControlError(ValueError):
     """制御メッセージが不正(型・範囲・未知の種別)."""
 
@@ -182,7 +189,10 @@ class XTestInjector:
                             continue
                         if loaded:  # 前の割り当てで押したキーを取り込ませてから付け替える
                             time.sleep(REMAP_SETTLE_SEC)
-                        loaded = self._load_spares(spares, empty, width, text[i:], touched)
+                        try:
+                            loaded = self._load_spares(spares, empty, width, text[i:], touched)
+                        except Exception as e:  # 途中まで入力済み。再送で二重に入らないよう、何文字入ったかを知らせる
+                            raise PartialInputError(i, len(text)) from e
                     self._tap(loaded[keysym], False)
             finally:
                 if touched:
@@ -281,7 +291,8 @@ class ControlChannel:
                 await asyncio.to_thread(self._inj.text, m["text"])
         except Exception as e:  # X の切断・空きキーコード無しなど。接続は切らずに error 応答で知らせる
             logger.warning("control %s injection failed: %s", m["type"], type(e).__name__)  # 内容(text)は出さない
-            return {"type": "error", "seq": seq, "error": f"injection failed: {type(e).__name__}"}
+            detail = str(e) if isinstance(e, PartialInputError) else type(e).__name__
+            return {"type": "error", "seq": seq, "error": f"injection failed: {detail}"}
         logger.debug("control %s", m["type"])  # 内容(text)は出さない
         return {"type": "ack", "seq": seq, "ok": True}
 
