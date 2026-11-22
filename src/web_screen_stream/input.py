@@ -12,13 +12,15 @@
 
 Playwright には依存しない(ブラウザを誰が起動したかに関係なく、X サーバへの入力として届く)。
 キーボード配列に無い文字(日本語など)は、空きキーコードへ一時的に Unicode keysym を割り当てて押す
-(xdotool と同じ方式)。入力した文字の内容はログに出さない(資格情報を打つ用途があるため)。
+(xdotool と同じ方式。加えて XKB の配列を読み直させる)。入力した文字の内容はログに出さない(資格情報を打つ用途があるため)。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import subprocess
 import threading
 import time
 
@@ -29,8 +31,7 @@ from Xlib.ext import xtest
 logger = logging.getLogger(__name__)
 
 MAX_TEXT_LEN = 256  # 1 メッセージで受ける文字数の上限(貼り付けの暴走を防ぐ)
-# 空きキーコードへ割り当てた後・戻す前の待ち。待たないと Chromium が配列の変更を取り込む前に押され、最初に割り当てた
-# 文字を使い続ける(実測: 0 秒で「日日日」、20ms 以上で「日本語」。余裕を見て 50ms)
+# 空きキーコードへ割り当てて配列を読み直させた後・戻す前の待ち(クライアントが配列の変更を取り込む前に押さないため)
 REMAP_SETTLE_SEC = 0.05
 
 _KEYS = {
@@ -85,10 +86,15 @@ class XTestInjector:
     """1 つの X ディスプレイへ XTEST で入力する. スレッド安全(内部ロックで直列化)."""
 
     def __init__(self, display: str, width: int, height: int):
-        self._d = Display(display)
+        try:
+            self._d = Display(display)
+        except Exception as e:  # Xlib の接続エラー類を呼び出し側が扱える RuntimeError にそろえる
+            raise RuntimeError(f"cannot connect to X display {display}: {e}") from e
         if not self._d.has_extension("XTEST"):
             self._d.close()
             raise RuntimeError(f"XTEST extension is not available on {display}")
+        self._display = display
+        self._named: set[int] | None = None  # XKB で名前のあるキーコード(初回の日本語入力時に取る)
         self._w, self._h = width, height
         self._lock = threading.Lock()
         self._shift = self._d.keysym_to_keycode(XK.XK_Shift_L)
@@ -127,14 +133,61 @@ class XTestInjector:
 
     def text(self, text: str) -> None:
         with self._lock:
-            for ch in text:
-                cp = ord(ch)
-                keysym = cp if 0x20 <= cp <= 0xFF else 0x01000000 | cp  # X の Unicode keysym 規則
-                code = self._d.keysym_to_keycode(keysym)
-                if code:
-                    self._tap(code, shift=self._d.keycode_to_keysym(code, 0) != keysym)
-                else:
-                    self._tap_remapped(keysym)
+            first = self._d.display.info.min_keycode
+            mapping = self._d.get_keyboard_mapping(first, self._d.display.info.max_keycode - first + 1)
+            named = self._named_keycodes() if any(not self._d.keysym_to_keycode(_keysym(ch)) for ch in text) else set()
+            # xkbcomp は XKB で名前の無いキーコードを書き戻せないので、名前のある空きキーコードだけを使う
+            spares = [first + i for i, syms in enumerate(mapping) if not any(syms) and first + i in named]
+            width = len(mapping[0])
+            loaded: dict[int, int] = {}  # keysym → 一時割り当てした空きキーコード
+            try:
+                for i, ch in enumerate(text):
+                    keysym = _keysym(ch)
+                    if keysym not in loaded:
+                        code = self._d.keysym_to_keycode(keysym)
+                        if code and code not in spares:
+                            self._tap(code, shift=self._d.keycode_to_keysym(code, 0) != keysym)
+                            continue
+                        loaded = self._load_spares(spares, width, text[i:])
+                    self._tap(loaded[keysym], shift=False)
+            finally:
+                if loaded:
+                    time.sleep(REMAP_SETTLE_SEC)
+                    for code in loaded.values():
+                        self._d.change_keyboard_mapping(code, [(X.NoSymbol,) * width])
+                    self._d.sync()
+
+    def _load_spares(self, spares: list[int], width: int, rest: str) -> dict[int, int]:
+        """配列に無い文字を、これから打つ順に空きキーコードへまとめて割り当て、XKB の配列を読み込み直す.
+
+        Chromium は XKB の配列を一度読むと、コアの ChangeKeyboardMapping(MappingNotify)では読み直さず、
+        XkbNewKeyboardNotify でしか更新しない(実測: Chromium 159 で「日本語」が「日日日」になる)。
+        そこで xkbcomp で今の配列を取り出して書き戻し、配列の読み直しを起こす(xkbcomp は Xvfb の依存で入っている)。
+        """
+        if not spares:
+            raise RuntimeError("no spare keycode to type this character")
+        loaded: dict[int, int] = {}
+        for ch in rest:
+            keysym = _keysym(ch)
+            if len(loaded) == len(spares):
+                break
+            code = self._d.keysym_to_keycode(keysym)
+            if keysym in loaded or (code and code not in spares):
+                continue
+            loaded[keysym] = spares[len(loaded)]
+            self._d.change_keyboard_mapping(loaded[keysym], [(keysym,) * width])
+        self._d.sync()
+        subprocess.run(["xkbcomp", "-w", "0", "-", self._display], input=self._dump_keymap(), capture_output=True, check=True, timeout=5)
+        time.sleep(REMAP_SETTLE_SEC)
+        return loaded
+
+    def _dump_keymap(self) -> bytes:
+        return subprocess.run(["xkbcomp", "-xkb", self._display, "-"], capture_output=True, check=True, timeout=5).stdout
+
+    def _named_keycodes(self) -> set[int]:
+        if self._named is None:
+            self._named = {int(n) for n in re.findall(rb"<[^>]+>\s*=\s*(\d+)\s*;", self._dump_keymap())}
+        return self._named
 
     def _tap(self, code: int, *, shift: bool) -> None:
         if shift:
@@ -145,24 +198,10 @@ class XTestInjector:
             xtest.fake_input(self._d, X.KeyRelease, self._shift)
         self._d.sync()
 
-    def _tap_remapped(self, keysym: int) -> None:
-        """配列に無い文字: 空きキーコードへ一時的に keysym を割り当てて押し、元に戻す(xdotool と同じ方式)."""
-        first = self._d.display.info.min_keycode
-        count = self._d.display.info.max_keycode - first + 1
-        mapping = self._d.get_keyboard_mapping(first, count)
-        spare = next((first + i for i, syms in enumerate(mapping) if not any(syms)), None)
-        if spare is None:
-            raise RuntimeError("no spare keycode to type this character")
-        width = len(mapping[0])
-        self._d.change_keyboard_mapping(spare, [(keysym,) * width])
-        self._d.sync()
-        try:
-            time.sleep(REMAP_SETTLE_SEC)
-            self._tap(spare, shift=False)
-            time.sleep(REMAP_SETTLE_SEC)
-        finally:
-            self._d.change_keyboard_mapping(spare, [(X.NoSymbol,) * width])
-            self._d.sync()
+
+def _keysym(ch: str) -> int:
+    cp = ord(ch)
+    return cp if 0x20 <= cp <= 0xFF else 0x01000000 | cp  # X の Unicode keysym 規則
 
 
 class ControlChannel:
@@ -180,14 +219,18 @@ class ControlChannel:
             m = parse_control_message(raw)
         except ControlError as e:
             return {"type": "error", "seq": seq, "error": str(e)}
-        if m["type"] == "pointer":
-            await asyncio.to_thread(self._inj.pointer, m["action"], m["x"], m["y"])
-        elif m["type"] == "wheel":
-            await asyncio.to_thread(self._inj.wheel, m["x"], m["y"], m["dy"])
-        elif m["type"] == "key":
-            await asyncio.to_thread(self._inj.key, m["key"])
-        else:
-            await asyncio.to_thread(self._inj.text, m["text"])
+        try:
+            if m["type"] == "pointer":
+                await asyncio.to_thread(self._inj.pointer, m["action"], m["x"], m["y"])
+            elif m["type"] == "wheel":
+                await asyncio.to_thread(self._inj.wheel, m["x"], m["y"], m["dy"])
+            elif m["type"] == "key":
+                await asyncio.to_thread(self._inj.key, m["key"])
+            else:
+                await asyncio.to_thread(self._inj.text, m["text"])
+        except Exception as e:  # X の切断・空きキーコード無しなど。接続は切らずに error 応答で知らせる
+            logger.warning("control %s injection failed: %s", m["type"], type(e).__name__)  # 内容(text)は出さない
+            return {"type": "error", "seq": seq, "error": f"injection failed: {type(e).__name__}"}
         logger.debug("control %s", m["type"])  # 内容(text)は出さない
         return {"type": "ack", "seq": seq, "ok": True}
 

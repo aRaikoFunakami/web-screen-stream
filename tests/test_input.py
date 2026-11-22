@@ -42,8 +42,18 @@ def test_invalid_messages_are_rejected(msg):
 def xvfb():
     if not shutil.which("Xvfb"):
         pytest.skip("Xvfb not installed")
+    from Xlib.display import Display
     proc = subprocess.Popen(["Xvfb", ":91", "-screen", "0", "640x480x24"], stderr=subprocess.DEVNULL)
-    time.sleep(1)
+    for _ in range(50):
+        try:
+            Display(":91").close()
+            break
+        except Exception:
+            time.sleep(0.1)
+    else:
+        proc.terminate()
+        proc.wait(timeout=5)
+        pytest.skip("Xvfb :91 did not accept connections (e.g. macOS XQuartz)")
     yield ":91"
     proc.terminate()
     proc.wait(timeout=5)
@@ -98,7 +108,10 @@ def test_draw_mouse_switches_ffmpeg_cursor_capture(draw, expected):
 
 
 def test_japanese_reaches_chromium_via_remapped_keycodes(xvfb):
-    """空きキーコードへの一時割り当てで打った日本語が、実際の Chromium の入力欄に入る(待ちが無いと最初の文字が繰り返される)."""
+    """空きキーコードへの一時割り当てで打った日本語が、実際の Chromium の入力欄に入る.
+
+    XKB の配列を読み直させないと、Chromium は最初に読んだ配列を使い続け「日日日」になる。メッセージをまたいでも同じ。
+    """
     pytest.importorskip("playwright")
     from playwright.sync_api import sync_playwright
     with sync_playwright() as pw:
@@ -107,9 +120,12 @@ def test_japanese_reaches_chromium_via_remapped_keycodes(xvfb):
         page.set_content("<input id=i autofocus>")
         page.click("#i")
         inj = XTestInjector(xvfb, 640, 480)
-        inj.text("日本語ab")
+        inj.text("a日本語b")
+        inj.text("漢字かな")
+        many = "".join(chr(c) for c in range(0x3041, 0x3097))  # 空きキーコードの数より多い種類の文字(読み直しを何度も挟む)
+        inj.text(many)
         inj.close()
         time.sleep(0.5)
         value = page.input_value("#i")
         b.close()
-    assert value == "日本語ab"
+    assert value == "a日本語b漢字かな" + many
