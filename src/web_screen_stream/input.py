@@ -180,20 +180,7 @@ class XTestInjector:
             try:
                 if needs_spare:  # 最初の割り当て(xkbcomp)は打ち始める前に済ませる(失敗しても何も入力していない)
                     loaded = self._load_spares(spares, empty, width, text, touched)
-                for i, ch in enumerate(text):
-                    keysym = _keysym(ch)
-                    if keysym not in loaded:
-                        base = self._base_key(keysym, empty)
-                        if base:
-                            self._tap(*base)
-                            continue
-                        if loaded:  # 前の割り当てで押したキーを取り込ませてから付け替える
-                            time.sleep(REMAP_SETTLE_SEC)
-                        try:
-                            loaded = self._load_spares(spares, empty, width, text[i:], touched)
-                        except Exception as e:  # 途中まで入力済み。再送で二重に入らないよう、何文字入ったかを知らせる
-                            raise PartialInputError(i, len(text)) from e
-                    self._tap(loaded[keysym], False)
+                self._type(text, spares, empty, width, loaded, touched)
             finally:
                 if touched:
                     try:
@@ -203,6 +190,25 @@ class XTestInjector:
                         self._sync()
                     except Exception:  # X が落ちていた等。元の例外(PartialInputError など)を上書きしない
                         logger.warning("restoring spare keycodes failed", exc_info=True)
+
+    def _type(self, text: str, spares: list[int], empty: set[int], width: int, loaded: dict[int, int], touched: set[int]) -> None:
+        i = 0
+        try:
+            for i, ch in enumerate(text):
+                    keysym = _keysym(ch)
+                    if keysym not in loaded:
+                        base = self._base_key(keysym, empty)
+                        if base:
+                            self._tap(*base)
+                            continue
+                        if loaded:  # 前の割り当てで押したキーを取り込ませてから付け替える
+                            time.sleep(REMAP_SETTLE_SEC)
+                        loaded = self._load_spares(spares, empty, width, text[i:], touched)
+                    self._tap(loaded[keysym], False)
+        except Exception as e:
+            if i == 0:
+                raise
+            raise PartialInputError(i, len(text)) from e  # 途中まで入力済み。再送で二重に入らないよう、何文字入ったかを知らせる
 
     def _base_key(self, keysym: int, empty: set[int]) -> tuple[int, bool] | None:
         """元の配列で Shift なし/ありで打てるキー (keycode, shift). AltGr 等の 3 段目以降は使わない(一時割り当てに回す)."""

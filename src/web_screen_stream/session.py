@@ -632,10 +632,11 @@ class SessionManager:
         channel = ControlChannel(injector, release)
         with self._control_lock:
             stopped = self._controllers.get(session_id) is not reservation or self._sessions.get(session_id) is not session
-            if stopped:  # 接続中にセッションが停止された
-                injector.close()
-                raise KeyError(f"Session {session_id} was stopped")
-            self._controllers[session_id] = channel
+            if not stopped:
+                self._controllers[session_id] = channel
+        if stopped:  # 接続中にセッションが停止された(close はロックの外で)
+            injector.close()
+            raise KeyError(f"Session {session_id} was stopped")
         return channel
 
     async def export_storage_state(self, session_id: str, path: str | None = None) -> dict:

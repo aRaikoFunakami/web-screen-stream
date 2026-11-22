@@ -128,6 +128,16 @@ def test_disconnect_right_after_auth_releases_control(client, monkeypatch):
         assert _auth(ws) == {"type": "ready"}  # 枠が解放されている
 
 
+def test_idle_control_ws_is_closed_when_session_stops(client):
+    _add_fake_session()
+    with pytest.raises(WebSocketDisconnect) as e:
+        with client.websocket_connect("/api/ws/control/s1") as ws:
+            assert _auth(ws) == {"type": "ready"}
+            main.session_manager._controllers["s1"].close()  # stop が操作チャネルを閉じた
+            ws.receive_json()  # 何も送らなくても 4004 で切られる
+    assert e.value.code == 4004
+
+
 def test_storage_state_requires_bearer_token(client):
     assert client.post("/api/sessions/s1/storage-state").status_code == 403
     assert client.post("/api/sessions/s1/storage-state?token=right-token").status_code == 403  # クエリでは受けない

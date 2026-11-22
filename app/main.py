@@ -246,11 +246,22 @@ async def ws_control(websocket: WebSocket, session_id: str):
         logger.warning("control channel for %s unavailable: %s", session_id, e)
         await websocket.close(code=1011, reason="control unavailable")
         return
+    recv: asyncio.Future | None = None  # 受信待ち(停止の検知のためキャンセルせずに持ち越す)
     try:
         await websocket.send_json({"type": "ready"})  # try の中で送る(直後に切られても finally で枠を解放する)
         while True:
+            if recv is None:
+                recv = asyncio.ensure_future(websocket.receive_text())
+            # ponytail: 停止の検知は STOP_POLL_SEC ごとのポーリング。即時が要るなら close から Event を立てる
+            done, _ = await asyncio.wait({recv}, timeout=STOP_POLL_SEC)
+            if channel.closed:  # 何も送ってこないクライアントにもセッションの停止を知らせる
+                await websocket.close(code=4004, reason="Session stopped")
+                return
+            if not done:
+                continue
+            task, recv = recv, None
             try:
-                raw = json.loads(await websocket.receive_text())
+                raw = json.loads(task.result())
             except (json.JSONDecodeError, KeyError, TypeError):  # KeyError/TypeError: バイナリフレーム
                 await websocket.send_json({"type": "error", "seq": None, "error": "invalid JSON"})
                 continue
@@ -263,6 +274,8 @@ async def ws_control(websocket: WebSocket, session_id: str):
     except Exception:  # バイナリフレーム・切断後の送信など
         logger.exception("control channel for %s failed", session_id)
     finally:
+        if recv is not None:
+            recv.cancel()
         try:
             await asyncio.to_thread(channel.close)  # 注入中なら終わるのを待つ(イベントループは止めない)
         except Exception:  # X が先に落ちていた等。枠は解放済み
@@ -270,6 +283,7 @@ async def ws_control(websocket: WebSocket, session_id: str):
 
 
 AUTH_TIMEOUT = 5.0
+STOP_POLL_SEC = 1.0
 
 
 def _token_ok(session_id: str, token: object) -> bool:
