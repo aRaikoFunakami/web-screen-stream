@@ -6,13 +6,14 @@ POST /api/sessions/{session_id}/storage-state で人がログインした後の�
 マルチセッション対応: セッションごとに独立した Xvfb を動的起動する。
 """
 
+import asyncio
 import json
 import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -126,7 +127,7 @@ async def create_session(req: CreateSessionRequest) -> dict:
             "session_id": session.session_id,
             "status": session.status,
             "ws_url": f"/api/ws/stream/{session.session_id}",
-            # 操作チャネルはこのトークンを知っている呼び出し元だけが開ける(?token=)
+            # 操作チャネルはこのトークンを知っている呼び出し元だけが開ける(WS は最初のメッセージ、POST は Bearer)
             "control_ws_url": f"/api/ws/control/{session.session_id}",
             "control_token": control_tokens[session.session_id],
         }
@@ -210,14 +211,21 @@ async def ws_stream(websocket: WebSocket, session_id: str):
 
 
 @app.websocket("/api/ws/control/{session_id}")
-async def ws_control(websocket: WebSocket, session_id: str, token: str = ""):
+async def ws_control(websocket: WebSocket, session_id: str):
     """クライアントの入力(pointer/wheel/key/text の JSON)を XTEST で注入する. 同時に 1 接続だけ.
 
-    セッション作成時に返した control_token(?token=)が一致しない接続は accept 前に拒否する。
+    最初のメッセージで {"type": "auth", "token": <control_token>} を送らせ、AUTH_TIMEOUT 秒以内に一致しなければ切る。
+    ブラウザの WebSocket はヘッダを付けられず、クエリに載せるとアクセスログに残るため、この方式にする。
     配信(閲覧)より強い権限なので、閲覧用 URL を知っているだけでは操作できない。
     """
+    await websocket.accept()
     expected = control_tokens.get(session_id)
-    if not expected or not secrets.compare_digest(token, expected):
+    try:
+        first = json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=AUTH_TIMEOUT))
+    except (asyncio.TimeoutError, json.JSONDecodeError, WebSocketDisconnect):
+        first = None
+    token = first.get("token") if isinstance(first, dict) and first.get("type") == "auth" else None
+    if not expected or not isinstance(token, str) or not secrets.compare_digest(token, expected):
         await websocket.close(code=4403, reason="Forbidden")
         return
     try:
@@ -228,7 +236,7 @@ async def ws_control(websocket: WebSocket, session_id: str, token: str = ""):
     except RuntimeError as e:
         await websocket.close(code=4009, reason=str(e)[:120])
         return
-    await websocket.accept()
+    await websocket.send_json({"type": "ready"})
     try:
         while True:
             try:
@@ -241,6 +249,15 @@ async def ws_control(websocket: WebSocket, session_id: str, token: str = ""):
         pass
     finally:
         channel.close()
+
+
+AUTH_TIMEOUT = 5.0
+
+
+def _bearer_ok(session_id: str, authorization: str | None) -> bool:
+    expected = control_tokens.get(session_id)
+    token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
+    return bool(expected) and secrets.compare_digest(token, expected)
 
 
 # 認証状態の保存先。共有の /tmp は使わない(他ユーザーの先回り作成・symlink を避ける)
@@ -258,10 +275,9 @@ def _private_dir(path: str) -> str:
 
 
 @app.post("/api/sessions/{session_id}/storage-state")
-async def save_storage_state(session_id: str, token: str = "") -> dict:
-    """人がログインした後の認証状態をファイルに保存し、中身の値を含まない要約だけを返す(control_token 必須)."""
-    expected = control_tokens.get(session_id)
-    if not expected or not secrets.compare_digest(token, expected):
+async def save_storage_state(session_id: str, authorization: str | None = Header(default=None)) -> dict:
+    """人がログインした後の認証状態をファイルに保存し、中身の値を含まない要約だけを返す(Authorization: Bearer <control_token>)."""
+    if not _bearer_ok(session_id, authorization):
         return JSONResponse(status_code=403, content={"error": "Forbidden"})
     try:
         state = await session_manager.export_storage_state(session_id)
