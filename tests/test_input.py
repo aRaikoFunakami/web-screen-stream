@@ -95,3 +95,21 @@ def test_draw_mouse_switches_ffmpeg_cursor_capture(draw, expected):
     from web_screen_stream.ffmpeg_source import FFmpegSource
     cmd = FFmpegSource(StreamConfig(draw_mouse=draw))._build_command()
     assert cmd[cmd.index("-draw_mouse") + 1] == expected
+
+
+def test_japanese_reaches_chromium_via_remapped_keycodes(xvfb):
+    """空きキーコードへの一時割り当てで打った日本語が、実際の Chromium の入力欄に入る(待ちが無いと最初の文字が繰り返される)."""
+    pytest.importorskip("playwright")
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        b = pw.chromium.launch(headless=False, env={"DISPLAY": xvfb}, args=["--window-position=0,0", "--window-size=640,480"])
+        page = b.new_page()
+        page.set_content("<input id=i autofocus>")
+        page.click("#i")
+        inj = XTestInjector(xvfb, 640, 480)
+        inj.text("日本語ab")
+        inj.close()
+        time.sleep(0.5)
+        value = page.input_value("#i")
+        b.close()
+    assert value == "日本語ab"
