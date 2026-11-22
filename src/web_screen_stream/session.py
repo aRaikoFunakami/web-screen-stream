@@ -606,7 +606,7 @@ class SessionManager:
 
         def release() -> None:  # 自分が持っている枠だけを解放する(停止・再作成後の古いチャネルが新しい枠を外さない)
             if self._controllers.get(session_id) is channel:
-                del self._controllers[session_id]
+                self._controllers.pop(session_id, None)  # stop と同時でも KeyError にしない
 
         channel = ControlChannel(injector, release)
         self._controllers[session_id] = channel

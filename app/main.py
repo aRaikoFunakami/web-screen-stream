@@ -242,12 +242,12 @@ async def ws_control(websocket: WebSocket, session_id: str):
         logger.warning("control channel for %s unavailable: %s", session_id, e)
         await websocket.close(code=1011, reason="control unavailable")
         return
-    await websocket.send_json({"type": "ready"})
     try:
+        await websocket.send_json({"type": "ready"})  # try の中で送る(直後に切られても finally で枠を解放する)
         while True:
             try:
                 raw = json.loads(await websocket.receive_text())
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, KeyError):  # KeyError: バイナリフレーム
                 await websocket.send_json({"type": "error", "seq": None, "error": "invalid JSON"})
                 continue
             await websocket.send_json(await channel.handle(raw))
@@ -272,7 +272,8 @@ def _token_ok(session_id: str, token: object) -> bool:
 
 
 def _bearer_ok(session_id: str, authorization: str | None) -> bool:
-    return _token_ok(session_id, authorization[7:] if authorization and authorization.startswith("Bearer ") else "")
+    scheme, _, token = (authorization or "").partition(" ")
+    return scheme.lower() == "bearer" and _token_ok(session_id, token)
 
 
 # 認証状態の保存先。共有の /tmp は使わない(他ユーザーの先回り作成・symlink を避ける)

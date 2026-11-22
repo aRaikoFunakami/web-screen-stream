@@ -84,6 +84,8 @@ def test_control_ws_second_connection_gets_4009_and_first_release_frees_it(clien
         assert ws1.receive_json() == {"type": "ack", "seq": 1, "ok": True}
         ws1.send_json({"type": "key", "key": "F13", "seq": 2})
         assert ws1.receive_json()["type"] == "error"
+        ws1.send_bytes(b"\x00")  # バイナリでも切らずに error を返す
+        assert ws1.receive_json()["type"] == "error"
         with pytest.raises(WebSocketDisconnect) as e:
             with client.websocket_connect("/api/ws/control/s1") as ws2:
                 _auth(ws2)
@@ -101,10 +103,31 @@ def test_control_ws_checks_token_current_at_auth_time(client):
     assert e.value.code == 4403
 
 
+def test_disconnect_right_after_auth_releases_control(client, monkeypatch):
+    from starlette.websockets import WebSocket
+    _add_fake_session()
+    real_send = WebSocket.send_json
+    failed = []
+
+    async def send_json(self, data, *a, **kw):
+        if data == {"type": "ready"} and not failed:  # 認証直後にクライアントが切った状態を再現する
+            failed.append(True)
+            raise WebSocketDisconnect(1006)
+        return await real_send(self, data, *a, **kw)
+
+    monkeypatch.setattr(WebSocket, "send_json", send_json)
+    with client.websocket_connect("/api/ws/control/s1") as ws:
+        ws.send_json({"type": "auth", "token": "right-token"})
+    assert failed
+    with client.websocket_connect("/api/ws/control/s1") as ws:
+        assert _auth(ws) == {"type": "ready"}  # 枠が解放されている
+
+
 def test_storage_state_requires_bearer_token(client):
     assert client.post("/api/sessions/s1/storage-state").status_code == 403
     assert client.post("/api/sessions/s1/storage-state?token=right-token").status_code == 403  # クエリでは受けない
     assert client.post("/api/sessions/s1/storage-state", headers={"Authorization": "Bearer wrong"}).status_code == 403
+    assert client.post("/api/sessions/s1/storage-state", headers={"Authorization": "bearer right-token"}).status_code == 404
     assert client.post("/api/sessions/s1/storage-state", headers={"Authorization": "Bearer \u00e9".encode("latin-1")}).status_code == 403
     r = client.post("/api/sessions/s1/storage-state", headers={"Authorization": "Bearer right-token"})
     assert r.status_code == 404  # 認証は通る(ブラウザの無いセッションなので 404)
