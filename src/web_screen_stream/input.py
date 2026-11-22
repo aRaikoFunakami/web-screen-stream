@@ -88,7 +88,7 @@ def parse_control_message(msg: object) -> dict:
             raise ControlError("dy must be an int in -10..10")
         return {"type": kind, "x": float(x), "y": float(y), "dy": dy}
     if kind == "key":
-        if msg.get("key") not in _KEYS:
+        if not isinstance(msg.get("key"), str) or msg["key"] not in _KEYS:  # list 等は dict の in で TypeError になる
             raise ControlError(f"unsupported key: {msg.get('key')!r}")
         return {"type": kind, "key": msg["key"]}
     if kind == "text":

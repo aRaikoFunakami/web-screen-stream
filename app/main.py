@@ -226,7 +226,7 @@ async def ws_control(websocket: WebSocket, session_id: str):
         first = json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=AUTH_TIMEOUT))
     except WebSocketDisconnect:  # 認証前にクライアントが切った
         return
-    except (asyncio.TimeoutError, json.JSONDecodeError, KeyError, TypeError):  # KeyError/TypeError: バイナリフレーム
+    except (asyncio.TimeoutError, ValueError, KeyError, TypeError, RecursionError):  # KeyError/TypeError: バイナリ、RecursionError: 深い入れ子
         first = None
     token = first.get("token") if isinstance(first, dict) and first.get("type") == "auth" else None
     # 期待値は受信後に引く(待っている間にセッションが作り直されたら、古いトークンでは通さない)
@@ -255,14 +255,15 @@ async def ws_control(websocket: WebSocket, session_id: str):
             # ponytail: 停止の検知は STOP_POLL_SEC ごとのポーリング。即時が要るなら close から Event を立てる
             done, _ = await asyncio.wait({recv}, timeout=STOP_POLL_SEC)
             if channel.closed:  # 何も送ってこないクライアントにもセッションの停止を知らせる
-                await websocket.close(code=4004, reason="Session stopped")
+                if not (done and recv.exception() is not None):  # クライアントが先に切っていたら閉じ直さない
+                    await websocket.close(code=4004, reason="Session stopped")
                 return
             if not done:
                 continue
             task, recv = recv, None
             try:
                 raw = json.loads(task.result())
-            except (json.JSONDecodeError, KeyError, TypeError):  # KeyError/TypeError: バイナリフレーム
+            except (ValueError, KeyError, TypeError, RecursionError):  # KeyError/TypeError: バイナリ、RecursionError: 深い入れ子
                 await websocket.send_json({"type": "error", "seq": None, "error": "invalid JSON"})
                 continue
             await websocket.send_json(await channel.handle(raw))

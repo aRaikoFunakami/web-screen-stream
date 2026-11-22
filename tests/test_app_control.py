@@ -87,6 +87,8 @@ def test_control_ws_second_connection_gets_4009_and_first_release_frees_it(clien
         assert ws1.receive_json()["type"] == "error"
         ws1.send_bytes(b"\x00")  # バイナリでも切らずに error を返す
         assert ws1.receive_json()["type"] == "error"
+        ws1.send_text("[" * 100000 + "]" * 100000)  # 深い入れ子でも切らない
+        assert ws1.receive_json()["type"] == "error"
         with pytest.raises(WebSocketDisconnect) as e:
             with client.websocket_connect("/api/ws/control/s1") as ws2:
                 _auth(ws2)

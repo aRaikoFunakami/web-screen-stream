@@ -30,6 +30,8 @@ def test_valid_messages_are_normalized(msg):
     {"type": "pointer", "action": "down", "x": True, "y": 0},
     {"type": "wheel", "x": 0, "y": 0, "dy": 11},
     {"type": "key", "key": "F13"},
+    {"type": "key", "key": ["Enter"]},
+    {"type": "key", "key": {"a": 1}},
     {"type": "text", "text": ""},
     {"type": "text", "text": "a" * 257},
     {"type": "text", "text": "a\x00b"},
