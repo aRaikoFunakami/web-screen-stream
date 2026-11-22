@@ -68,6 +68,16 @@ class TestSessionsAPI:
         assert client.post("/api/sessions", json={}).status_code == 422
 
 
+def test_delete_does_not_drop_token_of_session_recreated_meanwhile(client):
+    async def slow_stop(session_id):
+        main.control_tokens[session_id] = "new-token"  # 停止中に同じ id で作り直された
+
+    main.control_tokens["s1"] = "old-token"
+    with patch.object(main.session_manager, "stop", new=AsyncMock(side_effect=slow_stop)):
+        assert client.delete("/api/sessions/s1").status_code == 200
+    assert main.control_tokens["s1"] == "new-token"
+
+
 class TestWebSocket:
     def test_ws_session_not_found(self, client):
         """存在しないセッションの WebSocket は閉じられる."""

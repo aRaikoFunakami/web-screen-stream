@@ -167,8 +167,11 @@ async def get_session(session_id: str) -> dict:
 async def delete_session(session_id: str) -> dict:
     """セッション停止."""
     try:
+        token = control_tokens.get(session_id)
         await session_manager.stop(session_id)
-        control_tokens.pop(session_id, None)
+        # 停止を待つ間に同じ id で作り直されていたら、新しいトークンは消さない
+        if token is not None and control_tokens.get(session_id) == token:
+            del control_tokens[session_id]
         return {"session_id": session_id, "status": "stopped"}
     except KeyError:
         return JSONResponse(status_code=404, content={"error": "Session not found"})
@@ -259,7 +262,10 @@ async def ws_control(websocket: WebSocket, session_id: str):
     except Exception:  # バイナリフレーム・切断後の送信など
         logger.exception("control channel for %s failed", session_id)
     finally:
-        await asyncio.to_thread(channel.close)  # 注入中なら終わるのを待つ(イベントループは止めない)
+        try:
+            await asyncio.to_thread(channel.close)  # 注入中なら終わるのを待つ(イベントループは止めない)
+        except Exception:  # X が先に落ちていた等。枠は解放済み
+            logger.warning("closing control channel for %s failed", session_id, exc_info=True)
 
 
 AUTH_TIMEOUT = 5.0

@@ -630,8 +630,12 @@ class SessionManager:
         state = await page.context.storage_state(indexed_db=True)
         if path is not None:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "w") as f:
-                json.dump(state, f)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(state, f)
+            except BaseException:  # 書きかけの秘密ファイルを残さない
+                os.unlink(path)
+                raise
         return state
 
     def list_sessions(self) -> list[dict]:

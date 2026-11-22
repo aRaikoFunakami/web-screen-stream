@@ -159,10 +159,11 @@ class XTestInjector:
             first = self._d.display.info.min_keycode
             mapping = self._d.get_keyboard_mapping(first, self._d.display.info.max_keycode - first + 1)
             empty = {first + i for i, syms in enumerate(mapping) if not any(syms)}
-            named = self._named_keycodes() if any(not self._base_key(_keysym(ch), empty) for ch in text) else set()
+            needs_spare = any(not self._base_key(_keysym(ch), empty) for ch in text)
+            named = self._named_keycodes() if needs_spare else set()
             # xkbcomp は XKB で名前の無いキーコードを書き戻せないので、名前のある空きキーコードだけを使う
             spares = sorted(empty & named)
-            if named and not spares:  # 途中まで打ってから失敗しない(再送で二重に入るのを防ぐ)
+            if needs_spare and not spares:  # 途中まで打ってから失敗しない(再送で二重に入るのを防ぐ)
                 raise RuntimeError("no spare keycode to type this character")
             width = len(mapping[0])
             loaded: dict[int, int] = {}  # keysym → 一時割り当てした空きキーコード
