@@ -40,8 +40,8 @@ def test_invalid_messages_are_rejected(msg):
         parse_control_message(msg)
 
 
-def test_text_newlines_are_normalized():
-    assert parse_control_message({"type": "text", "text": "a\r\nb\rc\td"})["text"] == "a\nb\nc\td"
+def test_text_is_not_rewritten_so_partial_counts_match_client_positions():
+    assert parse_control_message({"type": "text", "text": "a\r\nb\rc\td"})["text"] == "a\r\nb\rc\td"
 
 
 @pytest.fixture

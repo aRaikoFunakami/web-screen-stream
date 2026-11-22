@@ -239,8 +239,8 @@ async def ws_control(websocket: WebSocket, session_id: str):
     except KeyError:
         await websocket.close(code=4004, reason="Session not found")
         return
-    except ControlBusyError as e:
-        await websocket.close(code=4009, reason=str(e)[:120])
+    except ControlBusyError:
+        await websocket.close(code=4009, reason="already controlled")  # reason は 123 バイトまで。id を入れない
         return
     except RuntimeError as e:
         logger.warning("control channel for %s unavailable: %s", session_id, e)
@@ -332,7 +332,7 @@ async def save_storage_state(session_id: str, authorization: str | None = Header
         state = await session_manager.export_storage_state(session_id, tmp)
         os.replace(tmp, path)
     except KeyError as e:
-        return JSONResponse(status_code=404, content={"error": str(e)})
+        return JSONResponse(status_code=404, content={"error": e.args[0] if e.args else "Session not found"})
     except Exception:  # ブラウザが落ちた等。値は出さない
         logger.exception("export storage state failed for %s", session_id)
         return JSONResponse(status_code=502, content={"error": "export storage state failed"})

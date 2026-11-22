@@ -49,7 +49,7 @@ _KEYS = {
 }
 
 
-_CONTROL_KEYSYMS = {"\n": XK.XK_Return, "\t": XK.XK_Tab}  # 貼り付けた改行・タブはキーとして押す
+_CONTROL_KEYSYMS = {"\n": XK.XK_Return, "\r": XK.XK_Return, "\t": XK.XK_Tab}  # CRLF の CR は _type で飛ばす  # 貼り付けた改行・タブはキーとして押す
 
 
 class PartialInputError(RuntimeError):
@@ -63,9 +63,9 @@ class ControlError(ValueError):
     """制御メッセージが不正(型・範囲・未知の種別)."""
 
 
-def _normalize_text(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    if any((ord(c) < 0x20 and c not in "\n\t") or 0x7F <= ord(c) <= 0x9F for c in text):
+def _check_text(text: str) -> str:
+    # 書き換えない(PartialInputError の文字数をクライアントが送った文字列の位置と一致させるため)
+    if any((ord(c) < 0x20 and c not in "\r\n\t") or 0x7F <= ord(c) <= 0x9F for c in text):
         raise ControlError("text must not contain control characters other than newline and tab")
     return text
 
@@ -95,7 +95,7 @@ def parse_control_message(msg: object) -> dict:
         text = msg.get("text")
         if not isinstance(text, str) or not text or len(text) > MAX_TEXT_LEN:
             raise ControlError(f"text must be a non-empty string up to {MAX_TEXT_LEN} chars")
-        return {"type": kind, "text": _normalize_text(text)}
+        return {"type": kind, "text": _check_text(text)}
     raise ControlError(f"unknown type: {kind!r}")
 
 
@@ -107,7 +107,13 @@ class XTestInjector:
             self._d = Display(display)
         except Exception as e:  # Xlib の接続エラー類を呼び出し側が扱える RuntimeError にそろえる
             raise RuntimeError(f"cannot connect to X display {display}: {e}") from e
-        if not self._d.has_extension("XTEST"):
+        try:
+            has_xtest = self._d.has_extension("XTEST")
+            self._shift = self._d.keysym_to_keycode(XK.XK_Shift_L)
+        except Exception as e:  # 接続直後に X が落ちた等
+            self._d.close()
+            raise RuntimeError(f"X display {display} is not usable: {e}") from e
+        if not has_xtest:
             self._d.close()
             raise RuntimeError(f"XTEST extension is not available on {display}")
         self._display = display
@@ -115,7 +121,6 @@ class XTestInjector:
         self._named: set[int] | None = None  # XKB で名前のあるキーコード(初回の日本語入力時に取る)
         self._w, self._h = width, height
         self._lock = threading.Lock()
-        self._shift = self._d.keysym_to_keycode(XK.XK_Shift_L)
 
     def close(self) -> None:
         with self._lock:
@@ -195,6 +200,8 @@ class XTestInjector:
         i = 0
         try:
             for i, ch in enumerate(text):
+                    if ch == "\r" and text[i + 1 : i + 2] == "\n":  # CRLF は Return 1 回
+                        continue
                     keysym = _keysym(ch)
                     if keysym not in loaded:
                         base = self._base_key(keysym, empty)
