@@ -9,15 +9,18 @@ android-screen-stream の StreamSession/StreamManager と同設計。
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from web_screen_stream.config import StreamConfig
+from web_screen_stream.input import ControlChannel, XTestInjector
 from web_screen_stream.ffmpeg_source import FFmpegSource
 from web_screen_stream.h264_extractor import H264UnitExtractor
 
@@ -25,6 +28,11 @@ if TYPE_CHECKING:
     from web_screen_stream.xvfb import XvfbManager
 
 logger = logging.getLogger(__name__)
+
+
+class ControlBusyError(RuntimeError):
+    """同じセッションの操作チャネルが既に開いている(呼び出し側は 4009 で返す)."""
+
 
 # GOP キャッシュの上限サイズ（4MB 超で自動クリア）
 MAX_GOP_BYTES = 4 * 1024 * 1024
@@ -405,6 +413,8 @@ class SessionManager:
         self._displays: dict[str, str] = {}  # session_id → display
         self._xvfb = xvfb_manager
         self._lock = asyncio.Lock()
+        self._control_lock = threading.Lock()  # open_control はスレッドからも呼ばれる
+        self._controllers: dict[str, ControlChannel | object] = {}  # session_id → 開いている操作チャネル(同時に 1 つだけ)
 
     async def create(
         self,
@@ -456,6 +466,7 @@ class SessionManager:
                         maxrate=config.maxrate,
                         bufsize=config.bufsize,
                         gop_size=config.gop_size,
+                        draw_mouse=config.draw_mouse,
                     )
 
                 # Phase 2: ブラウザ起動（url が指定された場合）
@@ -529,9 +540,18 @@ class SessionManager:
 
             browser_info = self._browsers.pop(session_id, None)
             chrome_pids = self._browser_pids.pop(session_id, None)
+            with self._control_lock:  # open_control(別スレッド)の予約・確定と排他にする
+                controller = self._controllers.pop(session_id, None)
             display = self._displays.pop(session_id, None)
 
         # ロック外で停止（I/O 待ちが長い可能性）
+
+        # 0. 操作チャネルを閉じる(同じディスプレイを次のセッションが使っても、古い操作が届かないように)
+        if isinstance(controller, ControlChannel):  # 接続中の予約(object)なら open_control 側が後始末する
+            try:
+                await asyncio.to_thread(controller.close)  # 注入中なら終わるのを待つ(イベントループは止めない)
+            except Exception:  # X が先に落ちていても、後続のプロセス停止は必ず行う
+                logger.exception("Error closing control channel for %s", session_id)
 
         # 1. FFmpeg + subscriber 停止
         try:
@@ -570,6 +590,80 @@ class SessionManager:
     def get(self, session_id: str) -> BrowserStreamSession | None:
         """セッション取得."""
         return self._sessions.get(session_id)
+
+    def open_control(self, session_id: str) -> ControlChannel:
+        """操作チャネルを開く. 同じセッションを同時に操作できるのは 1 つだけ.
+
+        X への接続を待つので、イベントループからは asyncio.to_thread で呼ぶとよい。
+
+        Raises:
+            KeyError: セッションが存在しない(接続中に停止された場合も)
+            ControlBusyError: 既に他の操作チャネルが開いている
+            RuntimeError: X に繋がらない / XTEST が使えない
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Session {session_id} not found")
+        reservation = object()  # X への接続中も枠を押さえる(スレッドから呼ばれても二重に通さない)
+        with self._control_lock:
+            if self._sessions.get(session_id) is not session:  # 予約の直前に停止された
+                raise KeyError(f"Session {session_id} not found")
+            # 静的 Xvfb では複数のセッションが同じディスプレイを使うので、ディスプレイ単位でも 1 つにする
+            same_display = any(
+                (s := self._sessions.get(sid)) is not None and s.display == session.display for sid in self._controllers
+            )
+            if session_id in self._controllers or same_display:
+                raise ControlBusyError(f"Session {session_id} is already being controlled")
+            self._controllers[session_id] = reservation
+        try:
+            w, h = (int(v) for v in session.resolution.split("x"))
+            injector = XTestInjector(session.display, w, h)
+        except BaseException:
+            with self._control_lock:
+                if self._controllers.get(session_id) is reservation:
+                    del self._controllers[session_id]
+            raise
+
+        def release() -> None:  # 自分が持っている枠だけを解放する(停止・再作成後の古いチャネルが新しい枠を外さない)
+            with self._control_lock:
+                if self._controllers.get(session_id) is channel:
+                    del self._controllers[session_id]
+
+        channel = ControlChannel(injector, release)
+        with self._control_lock:
+            stopped = self._controllers.get(session_id) is not reservation or self._sessions.get(session_id) is not session
+            if not stopped:
+                self._controllers[session_id] = channel
+        if stopped:  # 接続中にセッションが停止された(close はロックの外で)
+            injector.close()
+            raise KeyError(f"Session {session_id} was stopped")
+        return channel
+
+    async def export_storage_state(self, session_id: str, path: str | None = None) -> dict:
+        """このライブラリが起動したブラウザ(create(url=...))の認証状態を Playwright の storageState で返す.
+
+        人がブラウザを操作してログインした後に呼び、Cookie(HttpOnly 含む)・localStorage・IndexedDB を取り出す。
+        path を渡すと所有者だけが読める権限(0600)で排他作成する(既存ファイル・symlink があれば FileExistsError)。
+        返り値・ファイルは秘密情報として扱うこと。
+
+        Raises:
+            KeyError: セッションが無い、またはこのライブラリがブラウザを起動していない
+            FileExistsError: path が既に存在する
+        """
+        info = self._browsers.get(session_id)
+        if info is None:
+            raise KeyError(f"Session {session_id} has no browser launched by this manager")
+        _pw, _browser, page = info
+        state = await page.context.storage_state(indexed_db=True)
+        if path is not None:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(state, f)
+            except BaseException:  # 書きかけの秘密ファイルを残さない
+                os.unlink(path)
+                raise
+        return state
 
     def list_sessions(self) -> list[dict]:
         """アクティブセッション一覧（メタデータ付き）."""

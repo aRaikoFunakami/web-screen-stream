@@ -84,9 +84,13 @@ make down
 {
 	"session_id": "demo",
 	"status": "running",
-	"ws_url": "/api/ws/stream/demo"
+	"ws_url": "/api/ws/stream/demo",
+	"control_ws_url": "/api/ws/control/demo",
+	"control_token": "<操作用トークン>"
 }
 ```
+
+`control_token` は操作チャネルと認証状態の保存にだけ使う秘密の値。URL には載せない。
 
 主なエラー:
 
@@ -147,6 +151,34 @@ make down
 
 - バイナリフレームで H.264 Annex-B の NAL unit を送出
 - late-join でもデコード開始できるよう、接続直後に GOP キャッシュ（SPS/PPS/IDR 等）を先頭に送出
+
+### 操作チャネル（WebSocket）
+
+- `GET ws://localhost:8200/api/ws/control/{session_id}`
+
+配信中の Xvfb へ、クライアントのマウス・キー・文字を XTEST で注入する。映像の WebSocket とは別で、同じセッションを同時に操作できるのは 1 接続だけ。
+
+1. 接続後 5 秒以内に最初のメッセージで `{"type":"auth","token":"<control_token>"}` を送る。一致しなければ `4403` で切られる。通ると `{"type":"ready"}` が返る
+2. 以降は次の JSON を送る（任意で `seq` を付けると応答に入る）
+   - `{"type":"pointer","action":"down"|"move"|"up","x":0..1,"y":0..1}`（表示中の映像に対する比率）
+   - `{"type":"wheel","x":0..1,"y":0..1,"dy":-10..10}`（`dy>0` で下）
+   - `{"type":"key","key":"Enter"|"Backspace"|"Tab"|"Escape"|"Delete"|"ArrowLeft"|"ArrowRight"|"ArrowUp"|"ArrowDown"|"Home"|"End"}`
+   - `{"type":"text","text":"..."}`（IME 確定後の文字列。1 メッセージ 256 文字まで。日本語も可）
+3. 応答は `{"type":"ack","seq":n,"ok":true}` または `{"type":"error","seq":n,"error":"..."}`
+
+`XVFB_STATIC=1`（全セッションが 1 つのディスプレイを共有）では、操作チャネルはディスプレイごとに 1 つだけ開け、フォーカスのある別セッションのウィンドウにも入力が届く。人に操作させるときは動的 Xvfb（既定）で使う。
+
+切断コード: `4403` 認証失敗（存在しないセッションもトークンが無いのでこれになる） / `4004` 認証後にセッションが停止された / `4009` 他の接続が操作中 / `1011` X に繋がらない。
+
+入力した文字の内容はログに出さない。キー配列に無い文字は空きキーコードへ一時的に割り当て、`xkbcomp`（Xvfb の依存で入る）で配列を読み直させてから押す。
+
+### 認証状態の保存
+
+- `POST /api/sessions/{session_id}/storage-state`（ヘッダ `Authorization: Bearer <control_token>` 必須。無い・違うと `403`）
+
+人が操作チャネルでログインした後、このサーバが起動した Chromium の Playwright storageState（HttpOnly Cookie・localStorage・IndexedDB）を `~/.web-screen-stream/states/{session_id}.json` に保存する（環境変数 `STORAGE_STATE_DIR` で変更可）。ディレクトリは `0700`。ファイルは `0600` の一時ファイルを排他作成してから置き換える（同じセッションの前回の保存は上書きされ、失敗したときは残る）。レスポンスは値を含まない要約（Cookie の名前・ドメイン・HttpOnly、localStorage のキー名）と保存先のパス。
+
+ライブラリとして使うときは `SessionManager.open_control(session_id)`（2 つ目は `ControlBusyError`）と `SessionManager.export_storage_state(session_id, path=None)` を使う。`StreamConfig(draw_mouse=True)` で作ったセッションは、マウスカーソルを映像に描く（既定は描かない。操作させるセッションだけ True にする。単体サーバの REST からは指定できない）。
 
 ## ドキュメント
 

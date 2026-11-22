@@ -16,6 +16,7 @@ class StreamConfig:
         maxrate: H.264 最大ビットレート (例: "800k")
         bufsize: H.264 バッファサイズ (例: "500k")
         gop_size: GOP サイズ (フレーム数, Late-join 間隔)
+        draw_mouse: マウスカーソルを映像に描くか（操作チャネルで人が操作するときに True。既定は描かない）
     """
 
     display: str = ":99"
@@ -26,3 +27,4 @@ class StreamConfig:
     maxrate: str = "800k"
     bufsize: str = "500k"
     gop_size: int = 10
+    draw_mouse: bool = False

@@ -7,7 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
-    "playwright>=1.40.0",
+    "playwright>=1.51",
     "python-xlib>=0.33",
 ]
 
