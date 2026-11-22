@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import signal
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -412,7 +413,8 @@ class SessionManager:
         self._displays: dict[str, str] = {}  # session_id → display
         self._xvfb = xvfb_manager
         self._lock = asyncio.Lock()
-        self._controllers: dict[str, ControlChannel] = {}  # session_id → 開いている操作チャネル(同時に 1 つだけ)
+        self._control_lock = threading.Lock()  # open_control はスレッドからも呼ばれる
+        self._controllers: dict[str, ControlChannel | object] = {}  # session_id → 開いている操作チャネル(同時に 1 つだけ)
 
     async def create(
         self,
@@ -544,7 +546,7 @@ class SessionManager:
         # ロック外で停止（I/O 待ちが長い可能性）
 
         # 0. 操作チャネルを閉じる(同じディスプレイを次のセッションが使っても、古い操作が届かないように)
-        if controller is not None:
+        if isinstance(controller, ControlChannel):  # 接続中の予約(object)なら open_control 側が後始末する
             try:
                 await asyncio.to_thread(controller.close)  # 注入中なら終わるのを待つ(イベントループは止めない)
             except Exception:  # X が先に落ちていても、後続のプロセス停止は必ず行う
@@ -591,25 +593,41 @@ class SessionManager:
     def open_control(self, session_id: str) -> ControlChannel:
         """操作チャネルを開く. 同じセッションを同時に操作できるのは 1 つだけ.
 
+        X への接続を待つので、イベントループからは asyncio.to_thread で呼ぶとよい。
+
         Raises:
-            KeyError: セッションが存在しない
+            KeyError: セッションが存在しない(接続中に停止された場合も)
             ControlBusyError: 既に他の操作チャネルが開いている
             RuntimeError: X に繋がらない / XTEST が使えない
         """
         session = self._sessions.get(session_id)
         if session is None:
             raise KeyError(f"Session {session_id} not found")
-        if session_id in self._controllers:
-            raise ControlBusyError(f"Session {session_id} is already being controlled")
-        w, h = (int(v) for v in session.resolution.split("x"))
-        injector = XTestInjector(session.display, w, h)
+        reservation = object()  # X への接続中も枠を押さえる(スレッドから呼ばれても二重に通さない)
+        with self._control_lock:
+            if session_id in self._controllers:
+                raise ControlBusyError(f"Session {session_id} is already being controlled")
+            self._controllers[session_id] = reservation
+        try:
+            w, h = (int(v) for v in session.resolution.split("x"))
+            injector = XTestInjector(session.display, w, h)
+        except BaseException:
+            with self._control_lock:
+                if self._controllers.get(session_id) is reservation:
+                    del self._controllers[session_id]
+            raise
 
         def release() -> None:  # 自分が持っている枠だけを解放する(停止・再作成後の古いチャネルが新しい枠を外さない)
-            if self._controllers.get(session_id) is channel:
-                self._controllers.pop(session_id, None)  # stop と同時でも KeyError にしない
+            with self._control_lock:
+                if self._controllers.get(session_id) is channel:
+                    del self._controllers[session_id]
 
         channel = ControlChannel(injector, release)
-        self._controllers[session_id] = channel
+        with self._control_lock:
+            if self._controllers.get(session_id) is not reservation:  # 接続中にセッションが停止された
+                injector.close()
+                raise KeyError(f"Session {session_id} was stopped")
+            self._controllers[session_id] = channel
         return channel
 
     async def export_storage_state(self, session_id: str, path: str | None = None) -> dict:

@@ -151,6 +151,8 @@ class XTestInjector:
 
     def key(self, name: str) -> None:
         code = self._d.keysym_to_keycode(XK.string_to_keysym(_KEYS[name]))
+        if not code:
+            raise RuntimeError(f"key {name} is not on the keyboard map")
         with self._lock:
             self._tap(code, False)
 
@@ -169,6 +171,8 @@ class XTestInjector:
             loaded: dict[int, int] = {}  # keysym → 一時割り当てした空きキーコード
             touched: set[int] = set()  # この呼び出しで割り当てた空きキーコード(全部を戻す)
             try:
+                if needs_spare:  # 最初の割り当て(xkbcomp)は打ち始める前に済ませる(失敗しても何も入力していない)
+                    loaded = self._load_spares(spares, empty, width, text, touched)
                 for i, ch in enumerate(text):
                     keysym = _keysym(ch)
                     if keysym not in loaded:

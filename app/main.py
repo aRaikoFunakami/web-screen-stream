@@ -231,10 +231,11 @@ async def ws_control(websocket: WebSocket, session_id: str):
     token = first.get("token") if isinstance(first, dict) and first.get("type") == "auth" else None
     # 期待値は受信後に引く(待っている間にセッションが作り直されたら、古いトークンでは通さない)
     if not _token_ok(session_id, token):
+        logger.warning("control channel auth failed for %s", session_id)  # トークンの値は出さない
         await websocket.close(code=4403, reason="Forbidden")
         return
     try:
-        channel = session_manager.open_control(session_id)
+        channel = await asyncio.to_thread(session_manager.open_control, session_id)  # X への接続でループを止めない
     except KeyError:
         await websocket.close(code=4004, reason="Session not found")
         return

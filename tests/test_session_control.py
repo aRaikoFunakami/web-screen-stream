@@ -78,6 +78,25 @@ async def test_stop_still_cleans_up_when_channel_close_fails(monkeypatch):
     assert stopped == [True]
 
 
+def test_slot_is_reserved_while_connecting_and_stop_during_connect_wins(monkeypatch):
+    mgr = SessionManager()
+    mgr._sessions["s1"] = SimpleNamespace(display=":0", resolution="640x480")
+    seen = []
+
+    class SlowInjector(FakeInjector):
+        def __init__(self, *a):
+            super().__init__()
+            with pytest.raises(ControlBusyError):  # X へ接続中の 2 つ目は通さない
+                mgr.open_control("s1")
+            mgr._controllers.pop("s1")  # 接続中に stop された
+            seen.append(self)
+
+    monkeypatch.setattr("web_screen_stream.session.XTestInjector", SlowInjector)
+    with pytest.raises(KeyError):
+        mgr.open_control("s1")
+    assert seen[0].closed and "s1" not in mgr._controllers
+
+
 def test_open_control_failure_does_not_leave_session_locked(monkeypatch):
     def broken(*a):
         raise RuntimeError("no X")
