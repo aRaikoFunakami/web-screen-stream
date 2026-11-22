@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from web_screen_stream.config import StreamConfig
-from web_screen_stream.session import SessionManager
+from web_screen_stream.session import ControlBusyError, SessionManager
 from web_screen_stream.xvfb import XvfbManager, check_display
 
 logger = logging.getLogger(__name__)
@@ -233,8 +233,12 @@ async def ws_control(websocket: WebSocket, session_id: str):
     except KeyError:
         await websocket.close(code=4004, reason="Session not found")
         return
-    except RuntimeError as e:
+    except ControlBusyError as e:
         await websocket.close(code=4009, reason=str(e)[:120])
+        return
+    except RuntimeError as e:
+        logger.warning("control channel for %s unavailable: %s", session_id, e)
+        await websocket.close(code=1011, reason="control unavailable")
         return
     await websocket.send_json({"type": "ready"})
     try:
@@ -279,16 +283,13 @@ async def save_storage_state(session_id: str, authorization: str | None = Header
     """人がログインした後の認証状態をファイルに保存し、中身の値を含まない要約だけを返す(Authorization: Bearer <control_token>)."""
     if not _bearer_ok(session_id, authorization):
         return JSONResponse(status_code=403, content={"error": "Forbidden"})
-    try:
-        state = await session_manager.export_storage_state(session_id)
-    except KeyError as e:
-        return JSONResponse(status_code=404, content={"error": str(e)})
     path = os.path.join(_private_dir(STORAGE_STATE_DIR), f"{session_id}.json")
     if os.path.lexists(path):
         os.unlink(path)  # 上書きは消してから排他作成(既存の symlink を辿らない)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(state, f)
+    try:
+        state = await session_manager.export_storage_state(session_id, path)
+    except KeyError as e:
+        return JSONResponse(status_code=404, content={"error": str(e)})
     return {
         "path": path,
         "cookies": [{"name": c["name"], "domain": c["domain"], "httpOnly": c["httpOnly"]} for c in state["cookies"]],

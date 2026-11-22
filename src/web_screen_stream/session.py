@@ -9,6 +9,7 @@ android-screen-stream の StreamSession/StreamManager と同設計。
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -26,6 +27,11 @@ if TYPE_CHECKING:
     from web_screen_stream.xvfb import XvfbManager
 
 logger = logging.getLogger(__name__)
+
+
+class ControlBusyError(RuntimeError):
+    """同じセッションの操作チャネルが既に開いている(呼び出し側は 4009 で返す)."""
+
 
 # GOP キャッシュの上限サイズ（4MB 超で自動クリア）
 MAX_GOP_BYTES = 4 * 1024 * 1024
@@ -580,13 +586,14 @@ class SessionManager:
 
         Raises:
             KeyError: セッションが存在しない
-            RuntimeError: 既に他の操作チャネルが開いている / XTEST が使えない
+            ControlBusyError: 既に他の操作チャネルが開いている
+            RuntimeError: X に繋がらない / XTEST が使えない
         """
         session = self._sessions.get(session_id)
         if session is None:
             raise KeyError(f"Session {session_id} not found")
         if session_id in self._controllers:
-            raise RuntimeError(f"Session {session_id} is already being controlled")
+            raise ControlBusyError(f"Session {session_id} is already being controlled")
         w, h = (int(v) for v in session.resolution.split("x"))
         injector = XTestInjector(session.display, w, h)
         self._controllers.add(session_id)
@@ -596,16 +603,23 @@ class SessionManager:
         """このライブラリが起動したブラウザ(create(url=...))の認証状態を Playwright の storageState で返す.
 
         人がブラウザを操作してログインした後に呼び、Cookie(HttpOnly 含む)・localStorage・IndexedDB を取り出す。
-        path を渡すとファイルにも書く。返り値・ファイルは秘密情報として扱うこと。
+        path を渡すと所有者だけが読める権限(0600)で排他作成する(既存ファイル・symlink があれば FileExistsError)。
+        返り値・ファイルは秘密情報として扱うこと。
 
         Raises:
             KeyError: セッションが無い、またはこのライブラリがブラウザを起動していない
+            FileExistsError: path が既に存在する
         """
         info = self._browsers.get(session_id)
         if info is None:
             raise KeyError(f"Session {session_id} has no browser launched by this manager")
         _pw, _browser, page = info
-        return await page.context.storage_state(path=path, indexed_db=True)
+        state = await page.context.storage_state(indexed_db=True)
+        if path is not None:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(state, f)
+        return state
 
     def list_sessions(self) -> list[dict]:
         """アクティブセッション一覧（メタデータ付き）."""
