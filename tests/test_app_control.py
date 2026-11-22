@@ -44,7 +44,7 @@ def _auth(ws, token="right-token"):
 
 
 @pytest.mark.parametrize("first", [
-    {"type": "pointer"}, {"type": "auth", "token": "wrong"}, {"type": "auth"}, {"type": "auth", "token": "日本"}, "not json", b"\x00",
+    {"type": "pointer"}, {"type": "auth", "token": "wrong"}, {"type": "auth"}, {"type": "auth", "token": "日本"}, '{"type": "auth", "token": "\\ud800"}', "not json", b"\x00",
 ])
 def test_control_ws_rejects_missing_or_wrong_token(client, first):
     _add_fake_session()

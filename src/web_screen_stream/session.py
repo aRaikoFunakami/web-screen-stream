@@ -608,7 +608,11 @@ class SessionManager:
         with self._control_lock:
             if self._sessions.get(session_id) is not session:  # 予約の直前に停止された
                 raise KeyError(f"Session {session_id} not found")
-            if session_id in self._controllers:
+            # 静的 Xvfb では複数のセッションが同じディスプレイを使うので、ディスプレイ単位でも 1 つにする
+            same_display = any(
+                (s := self._sessions.get(sid)) is not None and s.display == session.display for sid in self._controllers
+            )
+            if session_id in self._controllers or same_display:
                 raise ControlBusyError(f"Session {session_id} is already being controlled")
             self._controllers[session_id] = reservation
         try:

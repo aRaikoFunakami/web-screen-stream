@@ -166,7 +166,7 @@ make down
    - `{"type":"text","text":"..."}`（IME 確定後の文字列。1 メッセージ 256 文字まで。日本語も可）
 3. 応答は `{"type":"ack","seq":n,"ok":true}` または `{"type":"error","seq":n,"error":"..."}`
 
-切断コード: `4403` 認証失敗 / `4004` セッションなし / `4009` 他の接続が操作中 / `1011` X に繋がらない。
+切断コード: `4403` 認証失敗（存在しないセッションもトークンが無いのでこれになる） / `4004` 認証後にセッションが停止された / `4009` 他の接続が操作中 / `1011` X に繋がらない。
 
 入力した文字の内容はログに出さない。キー配列に無い文字は空きキーコードへ一時的に割り当て、`xkbcomp`（Xvfb の依存で入る）で配列を読み直させてから押す。
 
@@ -174,7 +174,7 @@ make down
 
 - `POST /api/sessions/{session_id}/storage-state`（ヘッダ `Authorization: Bearer <control_token>` 必須。無い・違うと `403`）
 
-人が操作チャネルでログインした後、このサーバが起動した Chromium の Playwright storageState（HttpOnly Cookie・localStorage・IndexedDB）を `~/.web-screen-stream/states/{session_id}.json` に保存する（環境変数 `STORAGE_STATE_DIR` で変更可）。ディレクトリは `0700`、ファイルは `0600` で排他作成する。レスポンスは値を含まない要約（Cookie の名前・ドメイン・HttpOnly、localStorage のキー名）と保存先のパス。
+人が操作チャネルでログインした後、このサーバが起動した Chromium の Playwright storageState（HttpOnly Cookie・localStorage・IndexedDB）を `~/.web-screen-stream/states/{session_id}.json` に保存する（環境変数 `STORAGE_STATE_DIR` で変更可）。ディレクトリは `0700`。ファイルは `0600` の一時ファイルを排他作成してから置き換える（同じセッションの前回の保存は上書きされ、失敗したときは残る）。レスポンスは値を含まない要約（Cookie の名前・ドメイン・HttpOnly、localStorage のキー名）と保存先のパス。
 
 ライブラリとして使うときは `SessionManager.open_control(session_id)`（2 つ目は `ControlBusyError`）と `SessionManager.export_storage_state(session_id, path=None)` を使う。`StreamConfig(draw_mouse=True)` で作ったセッションは、マウスカーソルを映像に描く（既定は描かない。操作させるセッションだけ True にする。単体サーバの REST からは指定できない）。
 

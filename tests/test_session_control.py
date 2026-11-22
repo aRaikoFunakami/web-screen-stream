@@ -97,6 +97,18 @@ def test_slot_is_reserved_while_connecting_and_stop_during_connect_wins(monkeypa
     assert seen[0].closed and "s1" not in mgr._controllers
 
 
+def test_sessions_sharing_a_display_cannot_be_controlled_at_once(monkeypatch):
+    monkeypatch.setattr("web_screen_stream.session.XTestInjector", FakeInjector)
+    mgr = SessionManager()
+    mgr._sessions["a"] = SimpleNamespace(display=":99", resolution="640x480")
+    mgr._sessions["b"] = SimpleNamespace(display=":99", resolution="640x480")  # 静的 Xvfb
+    first = mgr.open_control("a")
+    with pytest.raises(ControlBusyError):
+        mgr.open_control("b")
+    first.close()
+    mgr.open_control("b").close()
+
+
 def test_open_control_failure_does_not_leave_session_locked(monkeypatch):
     def broken(*a):
         raise RuntimeError("no X")

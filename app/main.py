@@ -251,7 +251,7 @@ async def ws_control(websocket: WebSocket, session_id: str):
         while True:
             try:
                 raw = json.loads(await websocket.receive_text())
-            except (json.JSONDecodeError, KeyError):  # KeyError: バイナリフレーム
+            except (json.JSONDecodeError, KeyError, TypeError):  # KeyError/TypeError: バイナリフレーム
                 await websocket.send_json({"type": "error", "seq": None, "error": "invalid JSON"})
                 continue
             await websocket.send_json(await channel.handle(raw))
@@ -275,7 +275,12 @@ AUTH_TIMEOUT = 5.0
 def _token_ok(session_id: str, token: object) -> bool:
     expected = control_tokens.get(session_id)
     # bytes で比べる(str の compare_digest は非 ASCII で TypeError になる)
-    return bool(expected) and isinstance(token, str) and secrets.compare_digest(token.encode(), expected.encode())
+    if not expected or not isinstance(token, str):
+        return False
+    try:
+        return secrets.compare_digest(token.encode(), expected.encode())
+    except UnicodeEncodeError:  # 孤立サロゲート等
+        return False
 
 
 def _bearer_ok(session_id: str, authorization: str | None) -> bool:

@@ -196,10 +196,13 @@ class XTestInjector:
                     self._tap(loaded[keysym], False)
             finally:
                 if touched:
-                    time.sleep(REMAP_SETTLE_SEC)
-                    for code in touched:
-                        self._d.change_keyboard_mapping(code, [(X.NoSymbol,) * width])
-                    self._sync()
+                    try:
+                        time.sleep(REMAP_SETTLE_SEC)
+                        for code in touched:
+                            self._d.change_keyboard_mapping(code, [(X.NoSymbol,) * width])
+                        self._sync()
+                    except Exception:  # X が落ちていた等。元の例外(PartialInputError など)を上書きしない
+                        logger.warning("restoring spare keycodes failed", exc_info=True)
 
     def _base_key(self, keysym: int, empty: set[int]) -> tuple[int, bool] | None:
         """元の配列で Shift なし/ありで打てるキー (keycode, shift). AltGr 等の 3 段目以降は使わない(一時割り当てに回す)."""
