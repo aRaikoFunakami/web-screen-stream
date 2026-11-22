@@ -9,6 +9,7 @@ POST /api/sessions/{session_id}/storage-state で人がログインした後の�
 import json
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 # XVFB_STATIC=1 の場合は XvfbManager を使わず従来のグローバル Xvfb を使用
 xvfb_manager: XvfbManager | None = None
 session_manager: SessionManager  # lifespan で初期化
+control_tokens: dict[str, str] = {}  # session_id → 操作チャネルのトークン(create で発行、delete で破棄)
 
 
 @asynccontextmanager
@@ -119,10 +121,14 @@ async def create_session(req: CreateSessionRequest) -> dict:
             config=config,
             url=req.url,
         )
+        control_tokens[session.session_id] = secrets.token_urlsafe(24)
         return {
             "session_id": session.session_id,
             "status": session.status,
             "ws_url": f"/api/ws/stream/{session.session_id}",
+            # 操作チャネルはこのトークンを知っている呼び出し元だけが開ける(?token=)
+            "control_ws_url": f"/api/ws/control/{session.session_id}",
+            "control_token": control_tokens[session.session_id],
         }
     except ValueError as e:
         return JSONResponse(status_code=409, content={"error": str(e)})
@@ -161,6 +167,7 @@ async def delete_session(session_id: str) -> dict:
     """セッション停止."""
     try:
         await session_manager.stop(session_id)
+        control_tokens.pop(session_id, None)
         return {"session_id": session_id, "status": "stopped"}
     except KeyError:
         return JSONResponse(status_code=404, content={"error": "Session not found"})
@@ -203,8 +210,16 @@ async def ws_stream(websocket: WebSocket, session_id: str):
 
 
 @app.websocket("/api/ws/control/{session_id}")
-async def ws_control(websocket: WebSocket, session_id: str):
-    """クライアントの入力(pointer/wheel/key/text の JSON)を XTEST で注入する. 同時に 1 接続だけ."""
+async def ws_control(websocket: WebSocket, session_id: str, token: str = ""):
+    """クライアントの入力(pointer/wheel/key/text の JSON)を XTEST で注入する. 同時に 1 接続だけ.
+
+    セッション作成時に返した control_token(?token=)が一致しない接続は accept 前に拒否する。
+    配信(閲覧)より強い権限なので、閲覧用 URL を知っているだけでは操作できない。
+    """
+    expected = control_tokens.get(session_id)
+    if not expected or not secrets.compare_digest(token, expected):
+        await websocket.close(code=4403, reason="Forbidden")
+        return
     try:
         channel = session_manager.open_control(session_id)
     except KeyError:
@@ -228,19 +243,36 @@ async def ws_control(websocket: WebSocket, session_id: str):
         channel.close()
 
 
-STORAGE_STATE_DIR = os.environ.get("STORAGE_STATE_DIR", "/tmp/web-screen-stream-states")
+# 認証状態の保存先。共有の /tmp は使わない(他ユーザーの先回り作成・symlink を避ける)
+STORAGE_STATE_DIR = os.environ.get("STORAGE_STATE_DIR", os.path.join(os.path.expanduser("~"), ".web-screen-stream", "states"))
+
+
+def _private_dir(path: str) -> str:
+    """所有者だけが使えるディレクトリを用意する. symlink・他人所有なら拒否する."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.lstat(path)
+    if os.path.islink(path) or st.st_uid != os.getuid():
+        raise PermissionError(f"unsafe storage state dir: {path}")
+    os.chmod(path, 0o700)
+    return path
 
 
 @app.post("/api/sessions/{session_id}/storage-state")
-async def save_storage_state(session_id: str) -> dict:
-    """人がログインした後の認証状態をファイルに保存し、中身の値を含まない要約だけを返す."""
-    os.makedirs(STORAGE_STATE_DIR, mode=0o700, exist_ok=True)
-    path = os.path.join(STORAGE_STATE_DIR, f"{session_id}.json")
+async def save_storage_state(session_id: str, token: str = "") -> dict:
+    """人がログインした後の認証状態をファイルに保存し、中身の値を含まない要約だけを返す(control_token 必須)."""
+    expected = control_tokens.get(session_id)
+    if not expected or not secrets.compare_digest(token, expected):
+        return JSONResponse(status_code=403, content={"error": "Forbidden"})
     try:
-        state = await session_manager.export_storage_state(session_id, path)
+        state = await session_manager.export_storage_state(session_id)
     except KeyError as e:
         return JSONResponse(status_code=404, content={"error": str(e)})
-    os.chmod(path, 0o600)
+    path = os.path.join(_private_dir(STORAGE_STATE_DIR), f"{session_id}.json")
+    if os.path.lexists(path):
+        os.unlink(path)  # 上書きは消してから排他作成(既存の symlink を辿らない)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f)
     return {
         "path": path,
         "cookies": [{"name": c["name"], "domain": c["domain"], "httpOnly": c["httpOnly"]} for c in state["cookies"]],
