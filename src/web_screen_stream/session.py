@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from web_screen_stream.config import StreamConfig
+from web_screen_stream.input import ControlChannel, XTestInjector
 from web_screen_stream.ffmpeg_source import FFmpegSource
 from web_screen_stream.h264_extractor import H264UnitExtractor
 
@@ -405,6 +406,7 @@ class SessionManager:
         self._displays: dict[str, str] = {}  # session_id → display
         self._xvfb = xvfb_manager
         self._lock = asyncio.Lock()
+        self._controllers: set[str] = set()  # 操作チャネルを開いている session_id(同時に 1 つだけ)
 
     async def create(
         self,
@@ -529,6 +531,7 @@ class SessionManager:
 
             browser_info = self._browsers.pop(session_id, None)
             chrome_pids = self._browser_pids.pop(session_id, None)
+            self._controllers.discard(session_id)  # 停止後は操作チャネルを新たに開けない状態から戻す
             display = self._displays.pop(session_id, None)
 
         # ロック外で停止（I/O 待ちが長い可能性）
@@ -570,6 +573,38 @@ class SessionManager:
     def get(self, session_id: str) -> BrowserStreamSession | None:
         """セッション取得."""
         return self._sessions.get(session_id)
+
+    def open_control(self, session_id: str) -> ControlChannel:
+        """操作チャネルを開く. 同じセッションを同時に操作できるのは 1 つだけ.
+
+        Raises:
+            KeyError: セッションが存在しない
+            RuntimeError: 既に他の操作チャネルが開いている / XTEST が使えない
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Session {session_id} not found")
+        if session_id in self._controllers:
+            raise RuntimeError(f"Session {session_id} is already being controlled")
+        w, h = (int(v) for v in session.resolution.split("x"))
+        injector = XTestInjector(session.display, w, h)
+        self._controllers.add(session_id)
+        return ControlChannel(injector, lambda: self._controllers.discard(session_id))
+
+    async def export_storage_state(self, session_id: str, path: str | None = None) -> dict:
+        """このライブラリが起動したブラウザ(create(url=...))の認証状態を Playwright の storageState で返す.
+
+        人がブラウザを操作してログインした後に呼び、Cookie(HttpOnly 含む)・localStorage・IndexedDB を取り出す。
+        path を渡すとファイルにも書く。返り値・ファイルは秘密情報として扱うこと。
+
+        Raises:
+            KeyError: セッションが無い、またはこのライブラリがブラウザを起動していない
+        """
+        info = self._browsers.get(session_id)
+        if info is None:
+            raise KeyError(f"Session {session_id} has no browser launched by this manager")
+        _pw, _browser, page = info
+        return await page.context.storage_state(path=path, indexed_db=True)
 
     def list_sessions(self) -> list[dict]:
         """アクティブセッション一覧（メタデータ付き）."""
