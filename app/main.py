@@ -221,7 +221,9 @@ async def ws_control(websocket: WebSocket, session_id: str):
     await websocket.accept()
     try:
         first = json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=AUTH_TIMEOUT))
-    except (asyncio.TimeoutError, json.JSONDecodeError, KeyError, WebSocketDisconnect):  # KeyError: バイナリフレーム
+    except WebSocketDisconnect:  # 認証前にクライアントが切った
+        return
+    except (asyncio.TimeoutError, json.JSONDecodeError, KeyError):  # KeyError: バイナリフレーム
         first = None
     token = first.get("token") if isinstance(first, dict) and first.get("type") == "auth" else None
     # 期待値は受信後に引く(待っている間にセッションが作り直されたら、古いトークンでは通さない)
@@ -257,7 +259,7 @@ async def ws_control(websocket: WebSocket, session_id: str):
     except Exception:  # バイナリフレーム・切断後の送信など
         logger.exception("control channel for %s failed", session_id)
     finally:
-        channel.close()
+        await asyncio.to_thread(channel.close)  # 注入中なら終わるのを待つ(イベントループは止めない)
 
 
 AUTH_TIMEOUT = 5.0
@@ -292,7 +294,11 @@ async def save_storage_state(session_id: str, authorization: str | None = Header
     """人がログインした後の認証状態をファイルに保存し、中身の値を含まない要約だけを返す(Authorization: Bearer <control_token>)."""
     if not _bearer_ok(session_id, authorization):
         return JSONResponse(status_code=403, content={"error": "Forbidden"})
-    path = os.path.join(_private_dir(STORAGE_STATE_DIR), f"{session_id}.json")
+    try:
+        path = os.path.join(_private_dir(STORAGE_STATE_DIR), f"{session_id}.json")
+    except OSError as e:
+        logger.error("storage state dir unavailable: %s", e)
+        return JSONResponse(status_code=500, content={"error": "storage state dir unavailable"})
     # 一時ファイルへ排他作成してから置き換える(失敗しても前回の保存を消さない。rename は symlink を辿らない)
     tmp = f"{path}.{secrets.token_hex(8)}.tmp"
     try:
@@ -300,6 +306,9 @@ async def save_storage_state(session_id: str, authorization: str | None = Header
         os.replace(tmp, path)
     except KeyError as e:
         return JSONResponse(status_code=404, content={"error": str(e)})
+    except Exception:  # ブラウザが落ちた等。値は出さない
+        logger.exception("export storage state failed for %s", session_id)
+        return JSONResponse(status_code=502, content={"error": "export storage state failed"})
     finally:
         if os.path.lexists(tmp):
             os.unlink(tmp)

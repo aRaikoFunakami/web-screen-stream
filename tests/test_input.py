@@ -32,10 +32,16 @@ def test_valid_messages_are_normalized(msg):
     {"type": "key", "key": "F13"},
     {"type": "text", "text": ""},
     {"type": "text", "text": "a" * 257},
+    {"type": "text", "text": "a\x00b"},
+    {"type": "text", "text": "a\x85b"},
 ])
 def test_invalid_messages_are_rejected(msg):
     with pytest.raises(ControlError):
         parse_control_message(msg)
+
+
+def test_text_newlines_are_normalized():
+    assert parse_control_message({"type": "text", "text": "a\r\nb\rc\td"})["text"] == "a\nb\nc\td"
 
 
 @pytest.fixture

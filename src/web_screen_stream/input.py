@@ -56,6 +56,13 @@ class ControlError(ValueError):
     """制御メッセージが不正(型・範囲・未知の種別)."""
 
 
+def _normalize_text(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if any((ord(c) < 0x20 and c not in "\n\t") or 0x7F <= ord(c) <= 0x9F for c in text):
+        raise ControlError("text must not contain control characters other than newline and tab")
+    return text
+
+
 def parse_control_message(msg: object) -> dict:
     """制御メッセージを検証して正規化する(X には触れない。Android 版と同じ規則)."""
     if not isinstance(msg, dict):
@@ -81,7 +88,7 @@ def parse_control_message(msg: object) -> dict:
         text = msg.get("text")
         if not isinstance(text, str) or not text or len(text) > MAX_TEXT_LEN:
             raise ControlError(f"text must be a non-empty string up to {MAX_TEXT_LEN} chars")
-        return {"type": kind, "text": text}
+        return {"type": kind, "text": _normalize_text(text)}
     raise ControlError(f"unknown type: {kind!r}")
 
 
@@ -105,10 +112,18 @@ class XTestInjector:
 
     def close(self) -> None:
         with self._lock:
-            if self._button_down:  # 押したまま切断されたら離す(次の操作がドラッグにならないように)
-                xtest.fake_input(self._d, X.ButtonRelease, 1)
-                self._d.sync()
-            self._d.close()
+            try:
+                if self._button_down:  # 押したまま切断されたら離す(次の操作がドラッグにならないように)
+                    xtest.fake_input(self._d, X.ButtonRelease, 1)
+                    self._sync()
+            finally:
+                self._d.close()
+
+    def _sync(self) -> None:
+        """要求を流し、届いたイベント(配列の付け替えで来る MappingNotify 等)を捨てる. 読まないとキューが溜まり続ける."""
+        self._d.sync()
+        while self._d.pending_events():
+            self._d.next_event()
 
     def _xy(self, nx: float, ny: float) -> tuple[int, int]:
         return min(int(nx * self._w), self._w - 1), min(int(ny * self._h), self._h - 1)
@@ -122,7 +137,7 @@ class XTestInjector:
             elif action == "up":
                 xtest.fake_input(self._d, X.ButtonRelease, 1)
             self._button_down = (action == "down") or (self._button_down and action == "move")
-            self._d.sync()
+            self._sync()
 
     def wheel(self, nx: float, ny: float, dy: int) -> None:
         x, y = self._xy(nx, ny)
@@ -132,7 +147,7 @@ class XTestInjector:
             for _ in range(abs(dy)):
                 xtest.fake_input(self._d, X.ButtonPress, button)
                 xtest.fake_input(self._d, X.ButtonRelease, button)
-            self._d.sync()
+            self._sync()
 
     def key(self, name: str) -> None:
         code = self._d.keysym_to_keycode(XK.string_to_keysym(_KEYS[name]))
@@ -167,7 +182,7 @@ class XTestInjector:
                     time.sleep(REMAP_SETTLE_SEC)
                     for code in touched:
                         self._d.change_keyboard_mapping(code, [(X.NoSymbol,) * width])
-                    self._d.sync()
+                    self._sync()
 
     def _base_key(self, keysym: int, empty: set[int]) -> tuple[int, bool] | None:
         """元の配列で Shift なし/ありで打てるキー (keycode, shift). AltGr 等の 3 段目以降は使わない(一時割り当てに回す)."""
@@ -196,7 +211,7 @@ class XTestInjector:
             code = loaded[keysym] = spares[len(loaded)]
             touched.add(code)
             self._d.change_keyboard_mapping(code, [(keysym,) * width])
-        self._d.sync()
+        self._sync()
         subprocess.run(["xkbcomp", "-w", "0", "-", self._display], input=self._dump_keymap(), capture_output=True, check=True, timeout=5)
         time.sleep(REMAP_SETTLE_SEC)
         return loaded
@@ -216,7 +231,7 @@ class XTestInjector:
         xtest.fake_input(self._d, X.KeyRelease, code)
         if shift:
             xtest.fake_input(self._d, X.KeyRelease, self._shift)
-        self._d.sync()
+        self._sync()
 
 
 def _keysym(ch: str) -> int:
@@ -233,6 +248,7 @@ class ControlChannel:
         self._inj = injector
         self._on_close = on_close
         self._closed = False
+        self._close_lock = threading.Lock()
 
     @property
     def closed(self) -> bool:
@@ -263,9 +279,10 @@ class ControlChannel:
         return {"type": "ack", "seq": seq, "ok": True}
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._close_lock:  # stop(別スレッド)と WS の後始末が同時に来ても 1 回だけ閉じる
+            if self._closed:
+                return
+            self._closed = True
         try:
             self._inj.close()
         finally:
