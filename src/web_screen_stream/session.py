@@ -458,6 +458,7 @@ class SessionManager:
                         maxrate=config.maxrate,
                         bufsize=config.bufsize,
                         gop_size=config.gop_size,
+                        draw_mouse=config.draw_mouse,
                     )
 
                 # Phase 2: ブラウザ起動（url が指定された場合）
