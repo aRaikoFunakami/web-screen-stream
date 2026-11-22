@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 
 from Xlib import X, XK
 from Xlib.display import Display
@@ -28,6 +29,9 @@ from Xlib.ext import xtest
 logger = logging.getLogger(__name__)
 
 MAX_TEXT_LEN = 256  # 1 メッセージで受ける文字数の上限(貼り付けの暴走を防ぐ)
+# 空きキーコードへ割り当てた後・戻す前の待ち。待たないと Chromium が配列の変更を取り込む前に押され、最初に割り当てた
+# 文字を使い続ける(実測: 0 秒で「日日日」、20ms 以上で「日本語」。余裕を見て 50ms)
+REMAP_SETTLE_SEC = 0.05
 
 _KEYS = {
     "Enter": "Return",
@@ -153,7 +157,9 @@ class XTestInjector:
         self._d.change_keyboard_mapping(spare, [(keysym,) * width])
         self._d.sync()
         try:
+            time.sleep(REMAP_SETTLE_SEC)
             self._tap(spare, shift=False)
+            time.sleep(REMAP_SETTLE_SEC)
         finally:
             self._d.change_keyboard_mapping(spare, [(X.NoSymbol,) * width])
             self._d.sync()
