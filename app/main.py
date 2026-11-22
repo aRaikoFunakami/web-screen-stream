@@ -249,8 +249,13 @@ async def ws_control(websocket: WebSocket, session_id: str):
                 await websocket.send_json({"type": "error", "seq": None, "error": "invalid JSON"})
                 continue
             await websocket.send_json(await channel.handle(raw))
+            if channel.closed:  # セッションが停止された
+                await websocket.close(code=4004, reason="Session stopped")
+                return
     except WebSocketDisconnect:
         pass
+    except Exception:  # バイナリフレーム・切断後の送信など
+        logger.exception("control channel for %s failed", session_id)
     finally:
         channel.close()
 
@@ -284,12 +289,16 @@ async def save_storage_state(session_id: str, authorization: str | None = Header
     if not _bearer_ok(session_id, authorization):
         return JSONResponse(status_code=403, content={"error": "Forbidden"})
     path = os.path.join(_private_dir(STORAGE_STATE_DIR), f"{session_id}.json")
-    if os.path.lexists(path):
-        os.unlink(path)  # 上書きは消してから排他作成(既存の symlink を辿らない)
+    # 一時ファイルへ排他作成してから置き換える(失敗しても前回の保存を消さない。rename は symlink を辿らない)
+    tmp = f"{path}.{secrets.token_hex(8)}.tmp"
     try:
-        state = await session_manager.export_storage_state(session_id, path)
+        state = await session_manager.export_storage_state(session_id, tmp)
+        os.replace(tmp, path)
     except KeyError as e:
         return JSONResponse(status_code=404, content={"error": str(e)})
+    finally:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
     return {
         "path": path,
         "cookies": [{"name": c["name"], "domain": c["domain"], "httpOnly": c["httpOnly"]} for c in state["cookies"]],

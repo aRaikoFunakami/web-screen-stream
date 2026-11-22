@@ -412,7 +412,7 @@ class SessionManager:
         self._displays: dict[str, str] = {}  # session_id → display
         self._xvfb = xvfb_manager
         self._lock = asyncio.Lock()
-        self._controllers: set[str] = set()  # 操作チャネルを開いている session_id(同時に 1 つだけ)
+        self._controllers: dict[str, ControlChannel] = {}  # session_id → 開いている操作チャネル(同時に 1 つだけ)
 
     async def create(
         self,
@@ -538,10 +538,14 @@ class SessionManager:
 
             browser_info = self._browsers.pop(session_id, None)
             chrome_pids = self._browser_pids.pop(session_id, None)
-            self._controllers.discard(session_id)  # 停止後は操作チャネルを新たに開けない状態から戻す
+            controller = self._controllers.pop(session_id, None)
             display = self._displays.pop(session_id, None)
 
         # ロック外で停止（I/O 待ちが長い可能性）
+
+        # 0. 操作チャネルを閉じる(同じディスプレイを次のセッションが使っても、古い操作が届かないように)
+        if controller is not None:
+            await asyncio.to_thread(controller.close)  # 注入中なら終わるのを待つ(イベントループは止めない)
 
         # 1. FFmpeg + subscriber 停止
         try:
@@ -596,8 +600,14 @@ class SessionManager:
             raise ControlBusyError(f"Session {session_id} is already being controlled")
         w, h = (int(v) for v in session.resolution.split("x"))
         injector = XTestInjector(session.display, w, h)
-        self._controllers.add(session_id)
-        return ControlChannel(injector, lambda: self._controllers.discard(session_id))
+
+        def release() -> None:  # 自分が持っている枠だけを解放する(停止・再作成後の古いチャネルが新しい枠を外さない)
+            if self._controllers.get(session_id) is channel:
+                del self._controllers[session_id]
+
+        channel = ControlChannel(injector, release)
+        self._controllers[session_id] = channel
+        return channel
 
     async def export_storage_state(self, session_id: str, path: str | None = None) -> dict:
         """このライブラリが起動したブラウザ(create(url=...))の認証状態を Playwright の storageState で返す.

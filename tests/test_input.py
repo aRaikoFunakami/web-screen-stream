@@ -64,8 +64,11 @@ def test_pointer_moves_to_scaled_position(xvfb):
     inj = XTestInjector(xvfb, 640, 480)
     inj.pointer("move", 0.5, 0.25)
     pos = Display(xvfb).screen().root.query_pointer()
-    inj.close()
+    inj.pointer("down", 0.5, 0.25)
+    inj.close()  # 押したまま切断
+    from Xlib import X
     assert (pos.root_x, pos.root_y) == (320, 120)
+    assert not Display(xvfb).screen().root.query_pointer().mask & X.Button1Mask  # close で離されている
 
 
 def test_text_delivers_key_events_and_restores_spare_keycode(xvfb):

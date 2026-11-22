@@ -32,6 +32,31 @@ def test_second_open_control_is_rejected_until_first_closes(monkeypatch):
         mgr.open_control("missing")
 
 
+async def test_stop_closes_open_channel_and_stale_close_does_not_free_new_slot(monkeypatch):
+    monkeypatch.setattr("web_screen_stream.session.XTestInjector", FakeInjector)
+    mgr = SessionManager()
+
+    class FakeSession:
+        display, resolution = ":0", "640x480"
+
+        async def stop(self):
+            pass
+
+    mgr._sessions["s1"] = FakeSession()
+    old = mgr.open_control("s1")
+    await mgr.stop("s1")
+    assert old.closed and old._inj.closed  # 停止で古い操作チャネルも閉じる
+    assert (await old.handle({"type": "key", "key": "Enter"}))["type"] == "error"
+
+    mgr._sessions["s1"] = FakeSession()  # 同じ id で作り直す
+    new = mgr.open_control("s1")
+    old.close()  # 古いチャネルの後始末が新しい枠を外さない
+    with pytest.raises(ControlBusyError):
+        mgr.open_control("s1")
+    new.close()
+    mgr.open_control("s1").close()
+
+
 def test_open_control_failure_does_not_leave_session_locked(monkeypatch):
     def broken(*a):
         raise RuntimeError("no X")

@@ -116,6 +116,23 @@ def test_storage_state_is_written_owner_only_and_summary_hides_values(client):
     assert stat.S_IMODE(os.stat(body["path"]).st_mode) == 0o600
 
 
+def test_failed_storage_state_save_keeps_previous_file(client):
+    state = {"cookies": [], "origins": []}
+
+    async def ok(session_id, path=None):
+        with open(path, "x") as f:
+            f.write("PREVIOUS")
+        return state
+
+    headers = {"Authorization": "Bearer right-token"}
+    with patch.object(main.session_manager, "export_storage_state", new=AsyncMock(side_effect=ok)):
+        path = client.post("/api/sessions/s1/storage-state", headers=headers).json()["path"]
+    with patch.object(main.session_manager, "export_storage_state", new=AsyncMock(side_effect=KeyError("gone"))):
+        assert client.post("/api/sessions/s1/storage-state", headers=headers).status_code == 404
+    assert open(path).read() == "PREVIOUS"
+    assert os.listdir(main.STORAGE_STATE_DIR) == ["s1.json"]  # 一時ファイルは残らない
+
+
 def test_private_dir_rejects_symlink(tmp_path):
     target = tmp_path / "real"
     target.mkdir()

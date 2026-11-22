@@ -49,6 +49,9 @@ _KEYS = {
 }
 
 
+_CONTROL_KEYSYMS = {"\n": XK.XK_Return, "\t": XK.XK_Tab}  # 貼り付けた改行・タブはキーとして押す
+
+
 class ControlError(ValueError):
     """制御メッセージが不正(型・範囲・未知の種別)."""
 
@@ -94,6 +97,7 @@ class XTestInjector:
             self._d.close()
             raise RuntimeError(f"XTEST extension is not available on {display}")
         self._display = display
+        self._button_down = False
         self._named: set[int] | None = None  # XKB で名前のあるキーコード(初回の日本語入力時に取る)
         self._w, self._h = width, height
         self._lock = threading.Lock()
@@ -101,6 +105,9 @@ class XTestInjector:
 
     def close(self) -> None:
         with self._lock:
+            if self._button_down:  # 押したまま切断されたら離す(次の操作がドラッグにならないように)
+                xtest.fake_input(self._d, X.ButtonRelease, 1)
+                self._d.sync()
             self._d.close()
 
     def _xy(self, nx: float, ny: float) -> tuple[int, int]:
@@ -114,6 +121,7 @@ class XTestInjector:
                 xtest.fake_input(self._d, X.ButtonPress, 1)
             elif action == "up":
                 xtest.fake_input(self._d, X.ButtonRelease, 1)
+            self._button_down = (action == "down") or (self._button_down and action == "move")
             self._d.sync()
 
     def wheel(self, nx: float, ny: float, dy: int) -> None:
@@ -148,6 +156,8 @@ class XTestInjector:
                         if code and code not in spares:
                             self._tap(code, shift=self._d.keycode_to_keysym(code, 0) != keysym)
                             continue
+                        if loaded:  # 前の割り当てで押したキーを取り込ませてから付け替える
+                            time.sleep(REMAP_SETTLE_SEC)
                         loaded = self._load_spares(spares, width, text[i:])
                     self._tap(loaded[keysym], shift=False)
             finally:
@@ -200,6 +210,8 @@ class XTestInjector:
 
 
 def _keysym(ch: str) -> int:
+    if ch in _CONTROL_KEYSYMS:
+        return _CONTROL_KEYSYMS[ch]
     cp = ord(ch)
     return cp if 0x20 <= cp <= 0xFF else 0x01000000 | cp  # X の Unicode keysym 規則
 
@@ -212,6 +224,10 @@ class ControlChannel:
         self._on_close = on_close
         self._closed = False
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     async def handle(self, raw: object) -> dict:
         """制御メッセージを 1 件処理し、応答を返す. 不正なメッセージは error 応答(接続は切らない)."""
         seq = raw.get("seq") if isinstance(raw, dict) else None
@@ -219,6 +235,8 @@ class ControlChannel:
             m = parse_control_message(raw)
         except ControlError as e:
             return {"type": "error", "seq": seq, "error": str(e)}
+        if self._closed:
+            return {"type": "error", "seq": seq, "error": "control channel closed"}
         try:
             if m["type"] == "pointer":
                 await asyncio.to_thread(self._inj.pointer, m["action"], m["x"], m["y"])
