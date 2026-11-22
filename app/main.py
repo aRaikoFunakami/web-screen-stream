@@ -1,9 +1,12 @@
 """FastAPI application for Step 1 standalone server.
 
 WebSocket エンドポイント + REST API でブラウザ画面をストリーミング配信する。
+操作チャネル(WS /api/ws/control/{session_id})でクライアントのマウス・キー・文字を Xvfb へ注入し、
+POST /api/sessions/{session_id}/storage-state で人がログインした後の認証状態を保存できる。
 マルチセッション対応: セッションごとに独立した Xvfb を動的起動する。
 """
 
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -192,3 +195,54 @@ async def ws_stream(websocket: WebSocket, session_id: str):
     finally:
         logger.info("WebSocket client ended for session %s", session_id)
 
+
+
+# ============================================================
+# WebSocket: 操作チャネル(client → server の入力)
+# ============================================================
+
+
+@app.websocket("/api/ws/control/{session_id}")
+async def ws_control(websocket: WebSocket, session_id: str):
+    """クライアントの入力(pointer/wheel/key/text の JSON)を XTEST で注入する. 同時に 1 接続だけ."""
+    try:
+        channel = session_manager.open_control(session_id)
+    except KeyError:
+        await websocket.close(code=4004, reason="Session not found")
+        return
+    except RuntimeError as e:
+        await websocket.close(code=4009, reason=str(e)[:120])
+        return
+    await websocket.accept()
+    try:
+        while True:
+            try:
+                raw = json.loads(await websocket.receive_text())
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "seq": None, "error": "invalid JSON"})
+                continue
+            await websocket.send_json(await channel.handle(raw))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        channel.close()
+
+
+STORAGE_STATE_DIR = os.environ.get("STORAGE_STATE_DIR", "/tmp/web-screen-stream-states")
+
+
+@app.post("/api/sessions/{session_id}/storage-state")
+async def save_storage_state(session_id: str) -> dict:
+    """人がログインした後の認証状態をファイルに保存し、中身の値を含まない要約だけを返す."""
+    os.makedirs(STORAGE_STATE_DIR, mode=0o700, exist_ok=True)
+    path = os.path.join(STORAGE_STATE_DIR, f"{session_id}.json")
+    try:
+        state = await session_manager.export_storage_state(session_id, path)
+    except KeyError as e:
+        return JSONResponse(status_code=404, content={"error": str(e)})
+    os.chmod(path, 0o600)
+    return {
+        "path": path,
+        "cookies": [{"name": c["name"], "domain": c["domain"], "httpOnly": c["httpOnly"]} for c in state["cookies"]],
+        "origins": [{"origin": o["origin"], "localStorage": [i["name"] for i in o["localStorage"]]} for o in state["origins"]],
+    }
