@@ -137,42 +137,52 @@ class XTestInjector:
     def key(self, name: str) -> None:
         code = self._d.keysym_to_keycode(XK.string_to_keysym(_KEYS[name]))
         with self._lock:
-            self._tap(code, shift=False)
+            self._tap(code, False)
 
     def text(self, text: str) -> None:
         with self._lock:
             first = self._d.display.info.min_keycode
             mapping = self._d.get_keyboard_mapping(first, self._d.display.info.max_keycode - first + 1)
-            named = self._named_keycodes() if any(not self._d.keysym_to_keycode(_keysym(ch)) for ch in text) else set()
+            empty = {first + i for i, syms in enumerate(mapping) if not any(syms)}
+            named = self._named_keycodes() if any(not self._base_key(_keysym(ch), empty) for ch in text) else set()
             # xkbcomp は XKB で名前の無いキーコードを書き戻せないので、名前のある空きキーコードだけを使う
-            spares = [first + i for i, syms in enumerate(mapping) if not any(syms) and first + i in named]
+            spares = sorted(empty & named)
             width = len(mapping[0])
             loaded: dict[int, int] = {}  # keysym → 一時割り当てした空きキーコード
+            touched: set[int] = set()  # この呼び出しで割り当てた空きキーコード(全部を戻す)
             try:
                 for i, ch in enumerate(text):
                     keysym = _keysym(ch)
                     if keysym not in loaded:
-                        code = self._d.keysym_to_keycode(keysym)
-                        if code and code not in spares:
-                            self._tap(code, shift=self._d.keycode_to_keysym(code, 0) != keysym)
+                        base = self._base_key(keysym, empty)
+                        if base:
+                            self._tap(*base)
                             continue
                         if loaded:  # 前の割り当てで押したキーを取り込ませてから付け替える
                             time.sleep(REMAP_SETTLE_SEC)
-                        loaded = self._load_spares(spares, width, text[i:])
-                    self._tap(loaded[keysym], shift=False)
+                        loaded = self._load_spares(spares, empty, width, text[i:], touched)
+                    self._tap(loaded[keysym], False)
             finally:
-                if loaded:
+                if touched:
                     time.sleep(REMAP_SETTLE_SEC)
-                    for code in loaded.values():
+                    for code in touched:
                         self._d.change_keyboard_mapping(code, [(X.NoSymbol,) * width])
                     self._d.sync()
 
-    def _load_spares(self, spares: list[int], width: int, rest: str) -> dict[int, int]:
+    def _base_key(self, keysym: int, empty: set[int]) -> tuple[int, bool] | None:
+        """元の配列で Shift なし/ありで打てるキー (keycode, shift). AltGr 等の 3 段目以降は使わない(一時割り当てに回す)."""
+        for code, index in self._d.keysym_to_keycodes(keysym):
+            if index in (0, 1) and code not in empty:
+                return code, index == 1
+        return None
+
+    def _load_spares(self, spares: list[int], empty: set[int], width: int, rest: str, touched: set[int]) -> dict[int, int]:
         """配列に無い文字を、これから打つ順に空きキーコードへまとめて割り当て、XKB の配列を読み込み直す.
 
         Chromium は XKB の配列を一度読むと、コアの ChangeKeyboardMapping(MappingNotify)では読み直さず、
         XkbNewKeyboardNotify でしか更新しない(実測: Chromium 159 で「日本語」が「日日日」になる)。
         そこで xkbcomp で今の配列を取り出して書き戻し、配列の読み直しを起こす(xkbcomp は Xvfb の依存で入っている)。
+        割り当てたキーコードは先に touched へ入れる(xkbcomp が失敗しても呼び出し側が戻せるように)。
         """
         if not spares:
             raise RuntimeError("no spare keycode to type this character")
@@ -181,11 +191,11 @@ class XTestInjector:
             keysym = _keysym(ch)
             if len(loaded) == len(spares):
                 break
-            code = self._d.keysym_to_keycode(keysym)
-            if keysym in loaded or (code and code not in spares):
+            if keysym in loaded or self._base_key(keysym, empty):
                 continue
-            loaded[keysym] = spares[len(loaded)]
-            self._d.change_keyboard_mapping(loaded[keysym], [(keysym,) * width])
+            code = loaded[keysym] = spares[len(loaded)]
+            touched.add(code)
+            self._d.change_keyboard_mapping(code, [(keysym,) * width])
         self._d.sync()
         subprocess.run(["xkbcomp", "-w", "0", "-", self._display], input=self._dump_keymap(), capture_output=True, check=True, timeout=5)
         time.sleep(REMAP_SETTLE_SEC)
@@ -199,7 +209,7 @@ class XTestInjector:
             self._named = {int(n) for n in re.findall(rb"<[^>]+>\s*=\s*(\d+)\s*;", self._dump_keymap())}
         return self._named
 
-    def _tap(self, code: int, *, shift: bool) -> None:
+    def _tap(self, code: int, shift: bool) -> None:
         if shift:
             xtest.fake_input(self._d, X.KeyPress, self._shift)
         xtest.fake_input(self._d, X.KeyPress, code)

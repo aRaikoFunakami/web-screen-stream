@@ -123,12 +123,17 @@ def test_japanese_reaches_chromium_via_remapped_keycodes(xvfb):
         page.set_content("<input id=i autofocus>")
         page.click("#i")
         inj = XTestInjector(xvfb, 640, 480)
+        first = inj._d.display.info.min_keycode
+        count = inj._d.display.info.max_keycode - first + 1
+        before = [list(r) for r in inj._d.get_keyboard_mapping(first, count)]
         inj.text("a日本語b")
         inj.text("漢字かな")
         many = "".join(chr(c) for c in range(0x3041, 0x3097))  # 空きキーコードの数より多い種類の文字(読み直しを何度も挟む)
         inj.text(many)
+        after = [list(r) for r in inj._d.get_keyboard_mapping(first, count)]
         inj.close()
         time.sleep(0.5)
         value = page.input_value("#i")
         b.close()
     assert value == "a日本語b漢字かな" + many
+    assert after == before  # 何度付け替えても、空きキーコードは全部元に戻る

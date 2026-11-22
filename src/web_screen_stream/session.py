@@ -545,7 +545,10 @@ class SessionManager:
 
         # 0. 操作チャネルを閉じる(同じディスプレイを次のセッションが使っても、古い操作が届かないように)
         if controller is not None:
-            await asyncio.to_thread(controller.close)  # 注入中なら終わるのを待つ(イベントループは止めない)
+            try:
+                await asyncio.to_thread(controller.close)  # 注入中なら終わるのを待つ(イベントループは止めない)
+            except Exception:  # X が先に落ちていても、後続のプロセス停止は必ず行う
+                logger.exception("Error closing control channel for %s", session_id)
 
         # 1. FFmpeg + subscriber 停止
         try:

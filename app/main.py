@@ -219,13 +219,13 @@ async def ws_control(websocket: WebSocket, session_id: str):
     配信(閲覧)より強い権限なので、閲覧用 URL を知っているだけでは操作できない。
     """
     await websocket.accept()
-    expected = control_tokens.get(session_id)
     try:
         first = json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=AUTH_TIMEOUT))
-    except (asyncio.TimeoutError, json.JSONDecodeError, WebSocketDisconnect):
+    except (asyncio.TimeoutError, json.JSONDecodeError, KeyError, WebSocketDisconnect):  # KeyError: バイナリフレーム
         first = None
     token = first.get("token") if isinstance(first, dict) and first.get("type") == "auth" else None
-    if not expected or not isinstance(token, str) or not secrets.compare_digest(token, expected):
+    # 期待値は受信後に引く(待っている間にセッションが作り直されたら、古いトークンでは通さない)
+    if not _token_ok(session_id, token):
         await websocket.close(code=4403, reason="Forbidden")
         return
     try:
@@ -263,10 +263,14 @@ async def ws_control(websocket: WebSocket, session_id: str):
 AUTH_TIMEOUT = 5.0
 
 
-def _bearer_ok(session_id: str, authorization: str | None) -> bool:
+def _token_ok(session_id: str, token: object) -> bool:
     expected = control_tokens.get(session_id)
-    token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
-    return bool(expected) and secrets.compare_digest(token, expected)
+    # bytes で比べる(str の compare_digest は非 ASCII で TypeError になる)
+    return bool(expected) and isinstance(token, str) and secrets.compare_digest(token.encode(), expected.encode())
+
+
+def _bearer_ok(session_id: str, authorization: str | None) -> bool:
+    return _token_ok(session_id, authorization[7:] if authorization and authorization.startswith("Bearer ") else "")
 
 
 # 認証状態の保存先。共有の /tmp は使わない(他ユーザーの先回り作成・symlink を避ける)

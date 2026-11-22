@@ -42,12 +42,19 @@ def _auth(ws, token="right-token"):
     return ws.receive_json()
 
 
-@pytest.mark.parametrize("first", [{"type": "pointer"}, {"type": "auth", "token": "wrong"}, {"type": "auth"}, "not json"])
+@pytest.mark.parametrize("first", [
+    {"type": "pointer"}, {"type": "auth", "token": "wrong"}, {"type": "auth"}, {"type": "auth", "token": "日本"}, "not json", b"\x00",
+])
 def test_control_ws_rejects_missing_or_wrong_token(client, first):
     _add_fake_session()
     with pytest.raises(WebSocketDisconnect) as e:
         with client.websocket_connect("/api/ws/control/s1") as ws:
-            ws.send_json(first) if isinstance(first, dict) else ws.send_text(first)
+            if isinstance(first, dict):
+                ws.send_json(first)
+            elif isinstance(first, bytes):
+                ws.send_bytes(first)
+            else:
+                ws.send_text(first)
             ws.receive_text()
     assert e.value.code == 4403
 
@@ -85,10 +92,20 @@ def test_control_ws_second_connection_gets_4009_and_first_release_frees_it(clien
         assert _auth(ws3) == {"type": "ready"}
 
 
+def test_control_ws_checks_token_current_at_auth_time(client):
+    _add_fake_session()
+    with pytest.raises(WebSocketDisconnect) as e:
+        with client.websocket_connect("/api/ws/control/s1") as ws:
+            main.control_tokens["s1"] = "new-token"  # 認証待ちの間にセッションが作り直された
+            _auth(ws, "right-token")
+    assert e.value.code == 4403
+
+
 def test_storage_state_requires_bearer_token(client):
     assert client.post("/api/sessions/s1/storage-state").status_code == 403
     assert client.post("/api/sessions/s1/storage-state?token=right-token").status_code == 403  # クエリでは受けない
     assert client.post("/api/sessions/s1/storage-state", headers={"Authorization": "Bearer wrong"}).status_code == 403
+    assert client.post("/api/sessions/s1/storage-state", headers={"Authorization": "Bearer \u00e9".encode("latin-1")}).status_code == 403
     r = client.post("/api/sessions/s1/storage-state", headers={"Authorization": "Bearer right-token"})
     assert r.status_code == 404  # 認証は通る(ブラウザの無いセッションなので 404)
 

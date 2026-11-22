@@ -57,6 +57,27 @@ async def test_stop_closes_open_channel_and_stale_close_does_not_free_new_slot(m
     mgr.open_control("s1").close()
 
 
+async def test_stop_still_cleans_up_when_channel_close_fails(monkeypatch):
+    class BrokenInjector(FakeInjector):
+        def close(self):
+            raise OSError("X connection lost")
+
+    monkeypatch.setattr("web_screen_stream.session.XTestInjector", BrokenInjector)
+    stopped = []
+
+    class FakeSession:
+        display, resolution = ":0", "640x480"
+
+        async def stop(self):
+            stopped.append(True)
+
+    mgr = SessionManager()
+    mgr._sessions["s1"] = FakeSession()
+    mgr.open_control("s1")
+    await mgr.stop("s1")
+    assert stopped == [True]
+
+
 def test_open_control_failure_does_not_leave_session_locked(monkeypatch):
     def broken(*a):
         raise RuntimeError("no X")
