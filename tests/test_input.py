@@ -87,3 +87,11 @@ def test_text_delivers_key_events_and_restores_spare_keycode(xvfb):
     after = d.get_keyboard_mapping(first, d.display.info.max_keycode - first + 1)
     assert len(presses) >= 4  # a, Shift, b, 日(空きキーコード)
     assert [list(r) for r in after] == [list(r) for r in before]  # 一時割り当ては元に戻っている
+
+
+@pytest.mark.parametrize("draw, expected", [(False, "0"), (True, "1")])
+def test_draw_mouse_switches_ffmpeg_cursor_capture(draw, expected):
+    from web_screen_stream.config import StreamConfig
+    from web_screen_stream.ffmpeg_source import FFmpegSource
+    cmd = FFmpegSource(StreamConfig(draw_mouse=draw))._build_command()
+    assert cmd[cmd.index("-draw_mouse") + 1] == expected
