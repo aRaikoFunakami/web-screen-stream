@@ -396,6 +396,12 @@ async def _subscribe_with_timeout(
 # ============================================================
 
 
+@pytest.fixture(autouse=True)
+def _no_forced_loopback_bypass(monkeypatch):
+    """CI の環境に PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK があっても、proxy のテストを揺らさない。"""
+    monkeypatch.delenv("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK", raising=False)
+
+
 async def test_create_with_xvfb_keeps_config_fields(monkeypatch):
     """Xvfb の割り当てで display を差し替えても、draw_mouse・proxy などの項目を落とさない。"""
     from web_screen_stream.config import StreamConfig

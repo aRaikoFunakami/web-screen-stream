@@ -50,8 +50,9 @@ class StreamConfig:
 _HOST_RE = re.compile(r"[A-Za-z0-9._-]+|[0-9A-Fa-f:.]+")  # _ は compose のコンテナ名などで使う
 
 
-class ProxyConfigError(ValueError):
-    """StreamConfig.proxy が強制のプロキシとして使えない。"""
+class ProxyConfigError(Exception):
+    """StreamConfig.proxy が強制のプロキシとして使えない。create() の ValueError（同じ session_id がある）と取り違えない
+    よう、ValueError の下位にはしない。"""
 
 
 def check_proxy(proxy: object) -> dict[str, str]:

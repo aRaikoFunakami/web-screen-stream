@@ -440,7 +440,7 @@ class SessionManager:
 
         Raises:
             ValueError: 既に同じ session_id が存在する場合
-            ProxyConfigError: config.proxy が強制のプロキシとして使えない（ValueError の下位。区別するなら先に受ける）
+            ProxyConfigError: config.proxy が強制のプロキシとして使えない（url 無しで proxy を渡したときも）
             RuntimeError: Xvfb 起動失敗、ブラウザ起動失敗
         """
         async with self._lock:
@@ -703,8 +703,8 @@ class SessionManager:
         try:
             from playwright.async_api import async_playwright
         except ImportError:
-            if config.proxy is not None:  # proxy を求められたのにブラウザを起動できない。黙って続けない
-                raise ProxyConfigError("Playwright が無いので、proxy を通したブラウザを起動できません") from None
+            if config.proxy is not None:  # proxy を求められたのにブラウザを起動できない。黙って続けない（起動の失敗）
+                raise RuntimeError("Playwright が無いので、proxy を通したブラウザを起動できません") from None
             logger.warning("Playwright not available, skipping browser launch")
             return (None, None, None, set())
 

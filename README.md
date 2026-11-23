@@ -178,7 +178,7 @@ make down
 
 人が操作チャネルでログインした後、このサーバが起動した Chromium の Playwright storageState（HttpOnly Cookie・localStorage・IndexedDB）を `~/.web-screen-stream/states/{session_id}.json` に保存する（環境変数 `STORAGE_STATE_DIR` で変更可）。ディレクトリは `0700`。ファイルは `0600` の一時ファイルを排他作成してから置き換える（同じセッションの前回の保存は上書きされ、失敗したときは残る）。レスポンスは値を含まない要約（Cookie の名前・ドメイン・HttpOnly、localStorage のキー名）と保存先のパス。
 
-ライブラリとして使うときは `SessionManager.open_control(session_id)`（2 つ目は `ControlBusyError`）と `SessionManager.export_storage_state(session_id, path=None)` を使う。`StreamConfig(draw_mouse=True)` で作ったセッションは、マウスカーソルを映像に描く（既定は描かない。操作させるセッションだけ True にする。単体サーバの REST からは指定できない）。
+ライブラリとして使うときは `SessionManager.open_control(session_id)`（2 つ目は `ControlBusyError`）と `SessionManager.export_storage_state(session_id, path=None)` を使う。`StreamConfig(draw_mouse=True)` で作ったセッションは、マウスカーソルを映像に描く（既定は描かない。操作させるセッションだけ True にする。単体サーバの REST からは指定できない）。`StreamConfig(proxy={"server": "http://127.0.0.1:8899"})` は、自前起動する Chromium を Playwright の `launch(proxy=...)` でそのプロキシに通す（WebRTC の UDP もプロキシの外へ出さない）。`server` は http(s) の URL（スキーム・ホスト・ポートだけ）で、ほかに使える項目は `username`・`password`。`bypass` は使えない。ブラウザを起動する（`url` を渡す）`create()` でだけ使え、誤りは `ProxyConfigError`。単体サーバの REST からは指定できない。
 
 ## ドキュメント
 
