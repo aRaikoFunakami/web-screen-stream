@@ -13,6 +13,6 @@
 ### Fixed
 
 - `SessionManager.create`: Xvfb で display を割り当てるとき、`StreamConfig` を項目ごとに作り直していたため、足した項目（`draw_mouse` 以外の新しい項目）が落ちていた。`dataclasses.replace` で display だけを変える
-
+- `SessionManager._launch_browser`: Chromium の起動に失敗したとき、Playwright のドライバと起動しかけた Chromium が残っていた
 - `tests/test_api.py` が lifespan 前の `session_manager` を import して収集エラーになっていたのを直した
 - `tests/test_config.py` の framerate 既定値の期待を現行（15）に合わせた

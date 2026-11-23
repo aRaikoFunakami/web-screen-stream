@@ -465,7 +465,8 @@ async def test_launch_passes_proxy_only_when_set(monkeypatch):
     assert webrtc not in calls[0]["args"] and webrtc in calls[1]["args"]
 
 
-@pytest.mark.parametrize("proxy", [{}, {"server": ""}, {"server": "http://127.0.0.1:1", "bypass": "*.corp"}])
+@pytest.mark.parametrize("proxy", [{}, {"server": ""}, {"server": 123}, "http://127.0.0.1:1",
+                                   {"server": "http://127.0.0.1:1", "bypass": "*.corp"}])
 def test_proxy_must_have_server_and_no_bypass(proxy):
     """空の proxy で黙ってプロキシ無しに起動したり、bypass で強制のプロキシを抜けたりしない。"""
     from web_screen_stream.config import StreamConfig
@@ -481,3 +482,44 @@ def test_proxy_dict_is_copied():
     c = StreamConfig(proxy=p)
     p["server"] = "http://127.0.0.1:2"
     assert c.proxy == {"server": "http://127.0.0.1:1"}
+
+
+def test_proxy_refused_when_playwright_would_skip_loopback(monkeypatch):
+    from web_screen_stream.config import StreamConfig
+
+    monkeypatch.setenv("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK", "1")
+    with pytest.raises(ValueError):
+        StreamConfig(proxy={"server": "http://127.0.0.1:1"})
+
+
+async def test_launch_rechecks_proxy_and_stops_driver_on_failure(monkeypatch):
+    """作った後に bypass を足されても起動しない。起動に失敗したら Playwright のドライバを止める。"""
+    import playwright.async_api as pa
+
+    from web_screen_stream.config import StreamConfig
+
+    stopped = []
+
+    class _Chromium:
+        async def launch(self, **kw):
+            raise RuntimeError("launch failed")
+
+    class _PW:
+        chromium = _Chromium()
+
+        async def stop(self):
+            stopped.append(True)
+
+    class _Starter:
+        async def start(self):
+            return _PW()
+
+    monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
+    mgr = SessionManager()
+    c = StreamConfig(proxy={"server": "http://127.0.0.1:1"})
+    c.proxy["bypass"] = "*.corp"
+    with pytest.raises(ValueError):
+        await mgr._launch_browser("a", c, "about:blank")
+    with pytest.raises(RuntimeError):
+        await mgr._launch_browser("b", StreamConfig(proxy={"server": "http://127.0.0.1:1"}), "about:blank")
+    assert stopped == [True]

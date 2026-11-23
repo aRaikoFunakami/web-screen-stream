@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 
@@ -22,7 +23,7 @@ class StreamConfig:
         proxy: 自前起動する Chromium に渡すプロキシ（Playwright の launch(proxy=...) と同じ形の dict。例:
             {"server": "http://127.0.0.1:8899"}）。既定は無し。ブラウザの通信を絞り込むプロキシに強制的に通すときに使う
             （Playwright は --proxy-server と --proxy-bypass-list=<-loopback> を付け、localhost もプロキシを通す）。
-            "server" は必須、"bypass" は受け付けない（強制のプロキシを抜ける穴になるため）。設定したときは WebRTC の UDP も
+            "server" は必須、"bypass" は受け付けない（強制のプロキシを抜ける穴になるため。check_proxy）。設定したときは WebRTC の UDP も
             プロキシの外へ出さない（--webrtc-ip-handling-policy=disable_non_proxied_udp）
     """
 
@@ -39,8 +40,19 @@ class StreamConfig:
 
     def __post_init__(self) -> None:
         if self.proxy is not None:
-            if not self.proxy.get("server"):
-                raise ValueError("StreamConfig.proxy には server が要ります")
-            if "bypass" in self.proxy:
-                raise ValueError("StreamConfig.proxy の bypass は使えません（強制のプロキシを抜ける穴になるため）")
-            self.proxy = dict(self.proxy)  # 呼び出し元の dict を後から変えても、起動した設定と食い違わないように写す
+            self.proxy = check_proxy(self.proxy)  # 呼び出し元の dict を後から変えても、起動した設定と食い違わないように写す
+
+
+def check_proxy(proxy: object) -> dict[str, str]:
+    """強制のプロキシとして使える形か確かめて写しを返す。server（空でない文字列）は必須、bypass は拒む。
+
+    Playwright は環境変数 PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK があると <-loopback> を付けず、localhost が
+    プロキシの外へ出るので、そのときも拒む。起動の直前にも呼ぶ（StreamConfig は変更できるため）。"""
+    if not isinstance(proxy, dict) or not isinstance(proxy.get("server"), str) or not proxy["server"]:
+        raise ValueError("StreamConfig.proxy は server（空でない文字列）を持つ dict にしてください")
+    if "bypass" in proxy:
+        raise ValueError("StreamConfig.proxy の bypass は使えません（強制のプロキシを抜ける穴になるため）")
+    if os.environ.get("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK"):
+        raise ValueError("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK があると localhost がプロキシを通らないので、"
+                         "proxy は使えません")
+    return dict(proxy)
