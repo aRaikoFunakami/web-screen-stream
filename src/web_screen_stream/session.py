@@ -20,7 +20,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
-from web_screen_stream.config import StreamConfig, check_proxy
+from web_screen_stream.config import StreamConfig
 from web_screen_stream.input import ControlChannel, XTestInjector
 from web_screen_stream.ffmpeg_source import FFmpegSource
 from web_screen_stream.h264_extractor import H264UnitExtractor
@@ -398,35 +398,6 @@ async def _reap_chrome_pids(pids: set[int]) -> None:
         await asyncio.sleep(0.1)
 
 
-async def _close_browser(session_id: str, browser, pw) -> None:
-    if browser is not None:
-        try:
-            await browser.close()
-        except Exception:
-            logger.exception("Cleanup: error closing browser for %s", session_id)
-    if pw is not None:
-        try:
-            await pw.stop()
-        except Exception:
-            logger.exception("Cleanup: error stopping playwright for %s", session_id)
-
-
-async def _finish_cleanup(coro) -> None:
-    """片付けを最後まで行う。途中で取り消されても待ち続ける（呼び出し側は、この後で元の例外・取り消しを投げ直す）。
-    shield だけだと、取り消されたときに片付けが裏で走り続け、ロックの外で次の create() の登録を消しうる。"""
-    task = asyncio.ensure_future(coro)  # 待っている間は、このローカル変数が強い参照になる
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            continue
-
-
-async def _discard_launch(session_id: str, browser, pw, pids_before: set[int]) -> None:
-    await _close_browser(session_id, browser, pw)
-    await _reap_chrome_pids(_snapshot_chrome_pids() - pids_before)
-
-
 class SessionManager:
     """ブラウザストリーミングセッションの管理.
 
@@ -469,7 +440,6 @@ class SessionManager:
 
         Raises:
             ValueError: 既に同じ session_id が存在する場合
-            ProxyConfigError: config.proxy が強制のプロキシとして使えない（ValueError の下位。先に受けること）
             RuntimeError: Xvfb 起動失敗、ブラウザ起動失敗
         """
         async with self._lock:
@@ -482,7 +452,6 @@ class SessionManager:
             display = None
             pw = None
             browser = None
-            session: BrowserStreamSession | None = None
             chrome_pids: set[int] = set()
 
             try:
@@ -511,29 +480,34 @@ class SessionManager:
                 logger.info("Session %s created (url=%s)", session_id, url)
                 return session
 
-            except BaseException:
-                # 途中で取り消されたときも、作りかけの FFmpeg・ブラウザ・display を残さない。片付けの途中でもう一度
-                # 取り消されても、ロックを持ったまま最後まで終えてから投げ直す
-                await _finish_cleanup(self._discard_partial(session_id, session, browser, pw, chrome_pids, display))
+            except Exception:
+                # 逆順クリーンアップ
+                if browser:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        logger.exception(
+                            "Cleanup: error closing browser for %s", session_id
+                        )
+                if pw:
+                    try:
+                        await pw.stop()
+                    except Exception:
+                        logger.exception(
+                            "Cleanup: error stopping playwright for %s", session_id
+                        )
+                if chrome_pids:
+                    await _reap_chrome_pids(chrome_pids)
+                self._browsers.pop(session_id, None)
+                self._browser_pids.pop(session_id, None)
+                if display and self._xvfb:
+                    try:
+                        await self._xvfb.release(display)
+                    except Exception:
+                        logger.exception(
+                            "Cleanup: error releasing display %s", display
+                        )
                 raise
-
-    async def _discard_partial(self, session_id, session, browser, pw, chrome_pids, display) -> None:
-        """create() の途中で失敗・取り消されたときの逆順の片付け（各段の失敗は記録して次へ進む）."""
-        if session is not None:
-            try:
-                await session.stop()
-            except Exception:
-                logger.exception("Cleanup: error stopping stream for %s", session_id)
-        await _close_browser(session_id, browser, pw)
-        if chrome_pids:
-            await _reap_chrome_pids(chrome_pids)
-        self._browsers.pop(session_id, None)
-        self._browser_pids.pop(session_id, None)
-        if display and self._xvfb:
-            try:
-                await self._xvfb.release(display)
-            except Exception:
-                logger.exception("Cleanup: error releasing display %s", display)
 
     async def stop(self, session_id: str) -> None:
         """セッション停止: FFmpeg 停止 + ブラウザ終了 + リソース解放.
@@ -728,40 +702,38 @@ class SessionManager:
             logger.warning("Playwright not available, skipping browser launch")
             return (None, None, None, set())
 
-        proxy = check_proxy(config.proxy) if config.proxy is not None else None  # 作った後に変えられていても確かめる
         pids_before = _snapshot_chrome_pids()
-        pw = None
-        browser = None
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=False,
+            **({"proxy": config.proxy} if config.proxy else {}),
+            args=[
+                f"--display={config.display}",
+                "--no-sandbox",
+                "--disable-gpu",
+                f"--window-size={config.width},{config.height}",
+                "--window-position=0,0",
+                # proxy を通すときは、WebRTC の UDP（STUN・ICE）もプロキシの外へ直接出さない
+                *(["--webrtc-ip-handling-policy=disable_non_proxied_udp"] if config.proxy else []),
+            ],
+        )
+        page = await browser.new_page(
+            viewport={"width": config.width, "height": config.height}
+        )
         try:
-            pw = await async_playwright().start()
-            browser = await pw.chromium.launch(
-                headless=False,
-                **({"proxy": proxy} if proxy else {}),
-                args=[
-                    f"--display={config.display}",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    f"--window-size={config.width},{config.height}",
-                    "--window-position=0,0",
-                    # proxy を通すときは、WebRTC の UDP（STUN・ICE）もプロキシの外へ直接出さない。
-                    # --force-webrtc-ip-handling-policy は効かない（実 Chromium で ICE の候補を集めて確かめた）
-                    *(["--webrtc-ip-handling-policy=disable_non_proxied_udp"] if proxy else []),
-                ],
-            )
-            page = await browser.new_page(
-                viewport={"width": config.width, "height": config.height}
-            )
+            await page.goto(url, wait_until="domcontentloaded")
+        except Exception as e:
+            logger.error("Failed to navigate to %s: %s", url, e)
             try:
-                await page.goto(url, wait_until="domcontentloaded")
-            except Exception as e:
-                logger.error("Failed to navigate to %s: %s", url, e)
-                raise RuntimeError(f"URL '{url}' を開けませんでした: {e}") from e
-        except BaseException:
-            # 起動・最初のページの作成・移動のどこで失敗・取り消されても、ブラウザとドライバを止め、起動の前後で増えた
-            # Chromium の PID を刈り取る（成功したときの stop() と同じ方針。同じ時に別のところで起動した Chromium も
-            # 差分に入りうるのは既存の限界。#12）。もう一度取り消されても最後まで終えてから投げ直す
-            await _finish_cleanup(_discard_launch(session_id, browser, pw, pids_before))
-            raise
+                await browser.close()
+            except Exception:
+                pass
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+            await _reap_chrome_pids(_snapshot_chrome_pids() - pids_before)
+            raise RuntimeError(f"URL '{url}' を開けませんでした: {e}") from e
 
         chrome_pids = _snapshot_chrome_pids() - pids_before
         logger.info(
