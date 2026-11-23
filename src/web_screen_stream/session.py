@@ -713,6 +713,8 @@ class SessionManager:
                 "--disable-gpu",
                 f"--window-size={config.width},{config.height}",
                 "--window-position=0,0",
+                # proxy を通すときは、WebRTC の UDP（STUN・ICE）もプロキシの外へ直接出さない
+                *(["--webrtc-ip-handling-policy=disable_non_proxied_udp"] if config.proxy else []),
             ],
         )
         page = await browser.new_page(

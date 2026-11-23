@@ -460,3 +460,24 @@ async def test_launch_passes_proxy_only_when_set(monkeypatch):
     assert "proxy" not in calls[0]
     assert calls[1]["proxy"] == {"server": "http://127.0.0.1:1"}
     assert not any(a.startswith("--proxy") for a in calls[1]["args"])
+    # WebRTC の UDP もプロキシの外へ出さない（proxy を通すときだけ）
+    webrtc = "--webrtc-ip-handling-policy=disable_non_proxied_udp"
+    assert webrtc not in calls[0]["args"] and webrtc in calls[1]["args"]
+
+
+@pytest.mark.parametrize("proxy", [{}, {"server": ""}, {"server": "http://127.0.0.1:1", "bypass": "*.corp"}])
+def test_proxy_must_have_server_and_no_bypass(proxy):
+    """空の proxy で黙ってプロキシ無しに起動したり、bypass で強制のプロキシを抜けたりしない。"""
+    from web_screen_stream.config import StreamConfig
+
+    with pytest.raises(ValueError):
+        StreamConfig(proxy=proxy)
+
+
+def test_proxy_dict_is_copied():
+    from web_screen_stream.config import StreamConfig
+
+    p = {"server": "http://127.0.0.1:1"}
+    c = StreamConfig(proxy=p)
+    p["server"] = "http://127.0.0.1:2"
+    assert c.proxy == {"server": "http://127.0.0.1:1"}
