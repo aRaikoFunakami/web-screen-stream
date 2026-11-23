@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -44,6 +45,11 @@ class StreamConfig:
             self.proxy = check_proxy(self.proxy)  # 呼び出し元の dict を後から変えても、起動した設定と食い違わないように写す
 
 
+# ホスト名（英数字・ハイフン・ドット）か IP の直書き（IPv6 は [] の中身）だけ。「,」「;」や空白は --proxy-server で
+# 複数のプロキシの区切りになり、強制のプロキシが外れた先に代わりに繋がりうる
+_HOST_RE = re.compile(r"[A-Za-z0-9.-]+|[0-9A-Fa-f:.]+")
+
+
 class ProxyConfigError(ValueError):
     """StreamConfig.proxy が強制のプロキシとして使えない。"""
 
@@ -59,7 +65,7 @@ def check_proxy(proxy: object) -> dict[str, str]:
         port = url.port  # 範囲外のポートは ValueError
     except ValueError:
         raise ProxyConfigError("StreamConfig.proxy の server の形が崩れています") from None
-    if url.scheme not in ("http", "https") or not url.hostname or port == 0:
+    if url.scheme not in ("http", "https") or not url.hostname or not _HOST_RE.fullmatch(url.hostname) or port == 0:
         # SOCKS は Playwright が認証を扱えず起動で失敗するので、http(s) の URL だけを受け付ける（設定の時点で拒む）
         raise ProxyConfigError("StreamConfig.proxy の server は http:// か https:// の URL にしてください")
     if url.username or url.password or url.path not in ("", "/") or url.query or url.fragment:

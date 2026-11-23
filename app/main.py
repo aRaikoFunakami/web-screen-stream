@@ -17,7 +17,7 @@ from fastapi import FastAPI, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from web_screen_stream.config import ProxyConfigError, StreamConfig
+from web_screen_stream.config import StreamConfig
 from web_screen_stream.session import ControlBusyError, SessionManager
 from web_screen_stream.xvfb import XvfbManager, check_display
 
@@ -131,8 +131,6 @@ async def create_session(req: CreateSessionRequest) -> dict:
             "control_ws_url": f"/api/ws/control/{session.session_id}",
             "control_token": control_tokens[session.session_id],
         }
-    except ProxyConfigError as e:  # 設定の誤り（ValueError の下位なので先に受ける。409 の「同じ session_id」と区別する）
-        return JSONResponse(status_code=400, content={"error": str(e)})
     except ValueError as e:
         return JSONResponse(status_code=409, content={"error": str(e)})
     except RuntimeError as e:
