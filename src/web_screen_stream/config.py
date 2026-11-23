@@ -56,17 +56,21 @@ def check_proxy(proxy: object) -> dict[str, str]:
         raise ProxyConfigError("StreamConfig.proxy は server（空でない文字列）を持つ dict にしてください")
     try:
         url = urlsplit(proxy["server"])
-        port_ok = url.port is not None or url.scheme in ("http", "https")  # 範囲外のポートは .port が ValueError
+        port = url.port  # 範囲外のポートは ValueError
     except ValueError:
-        port_ok = False
-    if url.scheme not in ("http", "https") or not url.hostname or not port_ok:
+        raise ProxyConfigError("StreamConfig.proxy の server の形が崩れています") from None
+    if url.scheme not in ("http", "https") or not url.hostname or port == 0:
         # SOCKS は Playwright が認証を扱えず起動で失敗するので、http(s) の URL だけを受け付ける（設定の時点で拒む）
         raise ProxyConfigError("StreamConfig.proxy の server は http:// か https:// の URL にしてください")
+    if url.username or url.password or url.path not in ("", "/") or url.query or url.fragment:
+        # Playwright は server を「スキーム://ホスト:ポート」に作り直し、残りを黙って捨てる。認証は username・password に書く
+        raise ProxyConfigError("StreamConfig.proxy の server には、スキーム・ホスト・ポートだけを書いてください"
+                               "（認証は username・password に書く）")
     if "bypass" in proxy:
         raise ProxyConfigError("StreamConfig.proxy の bypass は使えません（強制のプロキシを抜ける穴になるため）")
     unknown = set(proxy) - {"server", "username", "password"}
     if unknown:
-        raise ProxyConfigError(f"StreamConfig.proxy に使えない項目があります: {sorted(unknown)}")
+        raise ProxyConfigError(f"StreamConfig.proxy に使えない項目があります: {sorted(map(repr, unknown))}")
     if any(not isinstance(proxy[k], str) for k in ("username", "password") if k in proxy):
         raise ProxyConfigError("StreamConfig.proxy の username・password は文字列にしてください")
     if os.environ.get("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK"):
