@@ -520,6 +520,72 @@ async def test_launch_rechecks_proxy_and_stops_driver_on_failure(monkeypatch):
     c.proxy["bypass"] = "*.corp"
     with pytest.raises(ValueError):
         await mgr._launch_browser("a", c, "about:blank")
+    reaped = []
+    monkeypatch.setattr("web_screen_stream.session._reap_chrome_pids", lambda pids: reaped.append(pids))
     with pytest.raises(RuntimeError):
         await mgr._launch_browser("b", StreamConfig(proxy={"server": "http://127.0.0.1:1"}), "about:blank")
     assert stopped == [True]
+    assert reaped == []  # PID の差分で刈り取らない（同じホストの他人の Chromium を止めない）
+
+
+async def test_new_page_failure_closes_browser_and_driver(monkeypatch):
+    import playwright.async_api as pa
+
+    from web_screen_stream.config import StreamConfig
+
+    events = []
+
+    class _Browser:
+        async def new_page(self, **k):
+            raise RuntimeError("target closed")
+
+        async def close(self):
+            events.append("browser.close")
+
+    class _Chromium:
+        async def launch(self, **kw):
+            return _Browser()
+
+    class _PW:
+        chromium = _Chromium()
+
+        async def stop(self):
+            events.append("pw.stop")
+
+    class _Starter:
+        async def start(self):
+            return _PW()
+
+    monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
+    with pytest.raises(RuntimeError):
+        await SessionManager()._launch_browser("c", StreamConfig(), "about:blank")
+    assert events == ["browser.close", "pw.stop"]
+
+
+async def test_create_cleans_up_when_cancelled(monkeypatch):
+    """create() が途中で取り消されても、Xvfb の display とブラウザを残さない。"""
+    from web_screen_stream.config import StreamConfig
+
+    released = []
+
+    class FakeXvfb:
+        async def allocate(self, w, h):
+            return ":102"
+
+        async def release(self, display):
+            released.append(display)
+
+    async def fake_launch(self, session_id, config, url):
+        return (None, None, None, set())
+
+    async def slow_start(self):
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(SessionManager, "_launch_browser", fake_launch)
+    monkeypatch.setattr(BrowserStreamSession, "start", slow_start)
+    task = asyncio.ensure_future(SessionManager(xvfb_manager=FakeXvfb()).create("s", StreamConfig(), url="about:blank"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert released == [":102"]

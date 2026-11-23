@@ -480,7 +480,7 @@ class SessionManager:
                 logger.info("Session %s created (url=%s)", session_id, url)
                 return session
 
-            except Exception:
+            except BaseException:  # 途中で取り消されたときも、作りかけのブラウザ・display を残さない
                 # 逆順クリーンアップ
                 if browser:
                     try:
@@ -705,6 +705,7 @@ class SessionManager:
         proxy = check_proxy(config.proxy) if config.proxy is not None else None  # 作った後に変えられていても確かめる
         pids_before = _snapshot_chrome_pids()
         pw = await async_playwright().start()
+        browser = None
         try:
             browser = await pw.chromium.launch(
                 headless=False,
@@ -720,17 +721,23 @@ class SessionManager:
                     *(["--webrtc-ip-handling-policy=disable_non_proxied_udp"] if proxy else []),
                 ],
             )
+            page = await browser.new_page(
+                viewport={"width": config.width, "height": config.height}
+            )
         except BaseException:
-            # 起動に失敗したら、Playwright のドライバと起動しかけた Chromium を残さない
+            # 起動・最初のページの作成に失敗したら、Playwright のドライバと起動した Chromium を残さない。
+            # PID の差分で刈り取ると、同じホストで同時に起動した他人の Chromium まで止めるので、pw.stop() に任せる
+            # （Playwright は自分が起動したブラウザを終了させる）
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    logger.exception("Cleanup: error closing browser for %s", session_id)
             try:
                 await pw.stop()
             except Exception:
-                pass
-            await _reap_chrome_pids(_snapshot_chrome_pids() - pids_before)
+                logger.exception("Cleanup: error stopping playwright for %s", session_id)
             raise
-        page = await browser.new_page(
-            viewport={"width": config.width, "height": config.height}
-        )
         try:
             await page.goto(url, wait_until="domcontentloaded")
         except Exception as e:
