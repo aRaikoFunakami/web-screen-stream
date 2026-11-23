@@ -20,7 +20,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
-from web_screen_stream.config import StreamConfig
+from web_screen_stream.config import StreamConfig, check_proxy
 from web_screen_stream.input import ControlChannel, XTestInjector
 from web_screen_stream.ffmpeg_source import FFmpegSource
 from web_screen_stream.h264_extractor import H264UnitExtractor
@@ -702,19 +702,21 @@ class SessionManager:
             logger.warning("Playwright not available, skipping browser launch")
             return (None, None, None, set())
 
+        proxy = check_proxy(config.proxy) if config.proxy is not None else None  # 作った後に変えられていても確かめる
         pids_before = _snapshot_chrome_pids()
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(
             headless=False,
-            **({"proxy": config.proxy} if config.proxy else {}),
+            **({"proxy": proxy} if proxy else {}),
             args=[
                 f"--display={config.display}",
                 "--no-sandbox",
                 "--disable-gpu",
                 f"--window-size={config.width},{config.height}",
                 "--window-position=0,0",
-                # proxy を通すときは、WebRTC の UDP（STUN・ICE）もプロキシの外へ直接出さない
-                *(["--webrtc-ip-handling-policy=disable_non_proxied_udp"] if config.proxy else []),
+                # proxy を通すときは、WebRTC の UDP（STUN・ICE）もプロキシの外へ直接出さない。
+                # --force-webrtc-ip-handling-policy は効かない（実 Chromium で ICE の候補を集めて確かめた）
+                *(["--webrtc-ip-handling-policy=disable_non_proxied_udp"] if proxy else []),
             ],
         )
         page = await browser.new_page(

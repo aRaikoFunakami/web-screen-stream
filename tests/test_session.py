@@ -465,7 +465,10 @@ async def test_launch_passes_proxy_only_when_set(monkeypatch):
     assert webrtc not in calls[0]["args"] and webrtc in calls[1]["args"]
 
 
-@pytest.mark.parametrize("proxy", [{}, {"server": ""}, {"server": "http://127.0.0.1:1", "bypass": "*.corp"}])
+@pytest.mark.parametrize("proxy", [{}, {"server": ""}, {"server": 123}, "http://127.0.0.1:1",
+                                   {"server": "http://127.0.0.1:1", "bypass": "*.corp"},
+                                   {"server": "http://127.0.0.1:1", "pasword": "x"},
+                                   {"server": "http://127.0.0.1:1", "username": 1}])
 def test_proxy_must_have_server_and_no_bypass(proxy):
     """空の proxy で黙ってプロキシ無しに起動したり、bypass で強制のプロキシを抜けたりしない。"""
     from web_screen_stream.config import StreamConfig
@@ -481,3 +484,33 @@ def test_proxy_dict_is_copied():
     c = StreamConfig(proxy=p)
     p["server"] = "http://127.0.0.1:2"
     assert c.proxy == {"server": "http://127.0.0.1:1"}
+
+
+def test_proxy_refused_when_playwright_would_skip_loopback(monkeypatch):
+    from web_screen_stream.config import ProxyConfigError, StreamConfig
+
+    monkeypatch.setenv("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK", "1")
+    with pytest.raises(ProxyConfigError):
+        StreamConfig(proxy={"server": "http://127.0.0.1:1"})
+
+
+def test_proxy_is_not_in_repr():
+    from web_screen_stream.config import StreamConfig
+
+    c = StreamConfig(proxy={"server": "http://127.0.0.1:1", "username": "u", "password": "s3cret"})
+    assert "s3cret" not in repr(c)
+
+
+async def test_launch_rechecks_proxy_before_starting_playwright(monkeypatch):
+    """作った後に bypass を足されても、Playwright を起動する前に拒む。"""
+    import playwright.async_api as pa
+
+    from web_screen_stream.config import ProxyConfigError, StreamConfig
+
+    started = []
+    monkeypatch.setattr(pa, "async_playwright", lambda: started.append(True))
+    c = StreamConfig(proxy={"server": "http://127.0.0.1:1"})
+    c.proxy["bypass"] = "*.corp"
+    with pytest.raises(ProxyConfigError):
+        await SessionManager()._launch_browser("a", c, "about:blank")
+    assert started == []
