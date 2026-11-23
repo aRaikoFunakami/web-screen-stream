@@ -1,5 +1,7 @@
 """ストリーミング設定."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 
@@ -17,6 +19,9 @@ class StreamConfig:
         bufsize: H.264 バッファサイズ (例: "500k")
         gop_size: GOP サイズ (フレーム数, Late-join 間隔)
         draw_mouse: マウスカーソルを映像に描くか（操作チャネルで人が操作するときに True。既定は描かない）
+        proxy: 自前起動する Chromium に渡すプロキシ（Playwright の launch(proxy=...) と同じ形の dict。例:
+            {"server": "http://127.0.0.1:8899"}）。既定は無し。ブラウザの通信を絞り込むプロキシに強制的に通すときに使う
+            （Playwright は --proxy-server と --proxy-bypass-list=<-loopback> を付け、localhost もプロキシを通す）
     """
 
     display: str = ":99"
@@ -28,3 +33,4 @@ class StreamConfig:
     bufsize: str = "500k"
     gop_size: int = 10
     draw_mouse: bool = False
+    proxy: dict[str, str] | None = None

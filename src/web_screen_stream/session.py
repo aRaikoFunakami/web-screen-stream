@@ -9,6 +9,7 @@ android-screen-stream の StreamSession/StreamManager と同設計。
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -457,17 +458,8 @@ class SessionManager:
                 # Phase 1: ディスプレイ確保（XvfbManager がある場合）
                 if self._xvfb:
                     display = await self._xvfb.allocate(config.width, config.height)
-                    config = StreamConfig(
-                        display=display,
-                        width=config.width,
-                        height=config.height,
-                        framerate=config.framerate,
-                        bitrate=config.bitrate,
-                        maxrate=config.maxrate,
-                        bufsize=config.bufsize,
-                        gop_size=config.gop_size,
-                        draw_mouse=config.draw_mouse,
-                    )
+                    # 項目を並べ直すと、足した項目（proxy など）が黙って落ちるので replace で display だけ変える
+                    config = dataclasses.replace(config, display=display)
 
                 # Phase 2: ブラウザ起動（url が指定された場合）
                 if url:
@@ -714,6 +706,7 @@ class SessionManager:
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(
             headless=False,
+            **({"proxy": config.proxy} if config.proxy else {}),
             args=[
                 f"--display={config.display}",
                 "--no-sandbox",

@@ -389,3 +389,74 @@ async def _subscribe_with_timeout(
         pass
     finally:
         await gen.aclose()
+
+
+# ============================================================
+# 起動の設定（proxy・Xvfb で割り当てた display）
+# ============================================================
+
+
+async def test_create_with_xvfb_keeps_config_fields(monkeypatch):
+    """Xvfb の割り当てで display を差し替えても、draw_mouse・proxy などの項目を落とさない。"""
+    from web_screen_stream.config import StreamConfig
+
+    class FakeXvfb:
+        async def allocate(self, w, h):
+            return ":101"
+
+        async def release(self, display):
+            pass
+
+    launched = []
+
+    async def fake_launch(self, session_id, config, url):
+        launched.append(config)
+        return (None, None, None, set())
+
+    async def fake_start(self):
+        return None
+
+    monkeypatch.setattr(SessionManager, "_launch_browser", fake_launch)
+    monkeypatch.setattr(BrowserStreamSession, "start", fake_start)
+    mgr = SessionManager(xvfb_manager=FakeXvfb())
+    proxy = {"server": "http://127.0.0.1:8899"}
+    await mgr.create("s", StreamConfig(draw_mouse=True, proxy=proxy), url="about:blank")
+    assert launched[0].display == ":101"
+    assert launched[0].draw_mouse is True and launched[0].proxy == proxy
+
+
+async def test_launch_passes_proxy_only_when_set(monkeypatch):
+    """proxy は Playwright の launch(proxy=...) に渡す（--proxy-server を args に足すと <-loopback> が付かない）。"""
+    import playwright.async_api as pa
+
+    from web_screen_stream.config import StreamConfig
+
+    calls = []
+
+    class _Page:
+        async def goto(self, *a, **k):
+            return None
+
+    class _Browser:
+        async def new_page(self, **k):
+            return _Page()
+
+    class _Chromium:
+        async def launch(self, **kw):
+            calls.append(kw)
+            return _Browser()
+
+    class _PW:
+        chromium = _Chromium()
+
+    class _Starter:
+        async def start(self):
+            return _PW()
+
+    monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
+    mgr = SessionManager()
+    await mgr._launch_browser("a", StreamConfig(), "about:blank")
+    await mgr._launch_browser("b", StreamConfig(proxy={"server": "http://127.0.0.1:1"}), "about:blank")
+    assert "proxy" not in calls[0]
+    assert calls[1]["proxy"] == {"server": "http://127.0.0.1:1"}
+    assert not any(a.startswith("--proxy") for a in calls[1]["args"])
