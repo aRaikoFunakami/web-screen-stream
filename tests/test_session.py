@@ -466,7 +466,9 @@ async def test_launch_passes_proxy_only_when_set(monkeypatch):
 
 
 @pytest.mark.parametrize("proxy", [{}, {"server": ""}, {"server": 123}, "http://127.0.0.1:1",
-                                   {"server": "http://127.0.0.1:1", "bypass": "*.corp"}])
+                                   {"server": "http://127.0.0.1:1", "bypass": "*.corp"},
+                                   {"server": "http://127.0.0.1:1", "pasword": "x"},
+                                   {"server": "http://127.0.0.1:1", "username": 1}])
 def test_proxy_must_have_server_and_no_bypass(proxy):
     """空の proxy で黙ってプロキシ無しに起動したり、bypass で強制のプロキシを抜けたりしない。"""
     from web_screen_stream.config import StreamConfig
@@ -521,11 +523,14 @@ async def test_launch_rechecks_proxy_and_stops_driver_on_failure(monkeypatch):
     with pytest.raises(ValueError):
         await mgr._launch_browser("a", c, "about:blank")
     reaped = []
-    monkeypatch.setattr("web_screen_stream.session._reap_chrome_pids", lambda pids: reaped.append(pids))
+    async def fake_reap(pids):
+        reaped.append(pids)
+
+    monkeypatch.setattr("web_screen_stream.session._reap_chrome_pids", fake_reap)
     with pytest.raises(RuntimeError):
         await mgr._launch_browser("b", StreamConfig(proxy={"server": "http://127.0.0.1:1"}), "about:blank")
     assert stopped == [True]
-    assert reaped == []  # PID の差分で刈り取らない（同じホストの他人の Chromium を止めない）
+    assert len(reaped) == 1  # 起動の前後で増えた Chromium を刈り取る（成功時の stop() と同じ方針）
 
 
 async def test_new_page_failure_closes_browser_and_driver(monkeypatch):
@@ -589,3 +594,80 @@ async def test_create_cleans_up_when_cancelled(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert released == [":102"]
+
+
+async def test_goto_cancelled_closes_browser_and_driver(monkeypatch):
+    """最初のページの移動の途中で取り消されても、ブラウザとドライバを残さない。"""
+    import playwright.async_api as pa
+
+    from web_screen_stream.config import StreamConfig
+
+    events = []
+    async def fake_reap(pids):
+        return None
+
+    monkeypatch.setattr("web_screen_stream.session._reap_chrome_pids", fake_reap)
+
+    class _Page:
+        async def goto(self, *a, **k):
+            await asyncio.sleep(10)
+
+    class _Browser:
+        async def new_page(self, **k):
+            return _Page()
+
+        async def close(self):
+            events.append("browser.close")
+
+    class _Chromium:
+        async def launch(self, **kw):
+            return _Browser()
+
+    class _PW:
+        chromium = _Chromium()
+
+        async def stop(self):
+            events.append("pw.stop")
+
+    class _Starter:
+        async def start(self):
+            return _PW()
+
+    monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
+    task = asyncio.ensure_future(SessionManager()._launch_browser("d", StreamConfig(), "about:blank"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.05)
+    assert events == ["browser.close", "pw.stop"]
+
+
+async def _noop():
+    return None
+
+
+async def test_create_cancelled_during_stream_start_stops_the_stream(monkeypatch):
+    from web_screen_stream.config import StreamConfig
+
+    stopped = []
+
+    async def fake_launch(self, session_id, config, url):
+        return (None, None, None, set())
+
+    async def slow_start(self):
+        await asyncio.sleep(10)
+
+    async def fake_stop(self):
+        stopped.append(self.session_id)
+
+    monkeypatch.setattr(SessionManager, "_launch_browser", fake_launch)
+    monkeypatch.setattr(BrowserStreamSession, "start", slow_start)
+    monkeypatch.setattr(BrowserStreamSession, "stop", fake_stop)
+    task = asyncio.ensure_future(SessionManager().create("s2", StreamConfig(), url="about:blank"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.05)
+    assert stopped == ["s2"]

@@ -52,6 +52,11 @@ def check_proxy(proxy: object) -> dict[str, str]:
         raise ValueError("StreamConfig.proxy は server（空でない文字列）を持つ dict にしてください")
     if "bypass" in proxy:
         raise ValueError("StreamConfig.proxy の bypass は使えません（強制のプロキシを抜ける穴になるため）")
+    unknown = set(proxy) - {"server", "username", "password"}
+    if unknown:
+        raise ValueError(f"StreamConfig.proxy に使えない項目があります: {sorted(unknown)}")
+    if any(not isinstance(proxy[k], str) for k in ("username", "password") if k in proxy):
+        raise ValueError("StreamConfig.proxy の username・password は文字列にしてください")
     if os.environ.get("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK"):
         raise ValueError("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK があると localhost がプロキシを通らないので、"
                          "proxy は使えません")

@@ -398,6 +398,24 @@ async def _reap_chrome_pids(pids: set[int]) -> None:
         await asyncio.sleep(0.1)
 
 
+async def _close_browser(session_id: str, browser, pw) -> None:
+    if browser is not None:
+        try:
+            await browser.close()
+        except Exception:
+            logger.exception("Cleanup: error closing browser for %s", session_id)
+    if pw is not None:
+        try:
+            await pw.stop()
+        except Exception:
+            logger.exception("Cleanup: error stopping playwright for %s", session_id)
+
+
+async def _discard_launch(session_id: str, browser, pw, pids_before: set[int]) -> None:
+    await _close_browser(session_id, browser, pw)
+    await _reap_chrome_pids(_snapshot_chrome_pids() - pids_before)
+
+
 class SessionManager:
     """ブラウザストリーミングセッションの管理.
 
@@ -452,6 +470,7 @@ class SessionManager:
             display = None
             pw = None
             browser = None
+            session: BrowserStreamSession | None = None
             chrome_pids: set[int] = set()
 
             try:
@@ -480,34 +499,29 @@ class SessionManager:
                 logger.info("Session %s created (url=%s)", session_id, url)
                 return session
 
-            except BaseException:  # 途中で取り消されたときも、作りかけのブラウザ・display を残さない
-                # 逆順クリーンアップ
-                if browser:
-                    try:
-                        await browser.close()
-                    except Exception:
-                        logger.exception(
-                            "Cleanup: error closing browser for %s", session_id
-                        )
-                if pw:
-                    try:
-                        await pw.stop()
-                    except Exception:
-                        logger.exception(
-                            "Cleanup: error stopping playwright for %s", session_id
-                        )
-                if chrome_pids:
-                    await _reap_chrome_pids(chrome_pids)
-                self._browsers.pop(session_id, None)
-                self._browser_pids.pop(session_id, None)
-                if display and self._xvfb:
-                    try:
-                        await self._xvfb.release(display)
-                    except Exception:
-                        logger.exception(
-                            "Cleanup: error releasing display %s", display
-                        )
+            except BaseException:
+                # 途中で取り消されたときも、作りかけの FFmpeg・ブラウザ・display を残さない。片付けの途中でもう一度
+                # 取り消されても最後まで進むよう、shield した別のタスクで行う
+                await asyncio.shield(self._discard_partial(session_id, session, browser, pw, chrome_pids, display))
                 raise
+
+    async def _discard_partial(self, session_id, session, browser, pw, chrome_pids, display) -> None:
+        """create() の途中で失敗・取り消されたときの逆順の片付け（各段の失敗は記録して次へ進む）."""
+        if session is not None:
+            try:
+                await session.stop()
+            except Exception:
+                logger.exception("Cleanup: error stopping stream for %s", session_id)
+        await _close_browser(session_id, browser, pw)
+        if chrome_pids:
+            await _reap_chrome_pids(chrome_pids)
+        self._browsers.pop(session_id, None)
+        self._browser_pids.pop(session_id, None)
+        if display and self._xvfb:
+            try:
+                await self._xvfb.release(display)
+            except Exception:
+                logger.exception("Cleanup: error releasing display %s", display)
 
     async def stop(self, session_id: str) -> None:
         """セッション停止: FFmpeg 停止 + ブラウザ終了 + リソース解放.
@@ -724,34 +738,17 @@ class SessionManager:
             page = await browser.new_page(
                 viewport={"width": config.width, "height": config.height}
             )
+            try:
+                await page.goto(url, wait_until="domcontentloaded")
+            except Exception as e:
+                logger.error("Failed to navigate to %s: %s", url, e)
+                raise RuntimeError(f"URL '{url}' を開けませんでした: {e}") from e
         except BaseException:
-            # 起動・最初のページの作成に失敗したら、Playwright のドライバと起動した Chromium を残さない。
-            # PID の差分で刈り取ると、同じホストで同時に起動した他人の Chromium まで止めるので、pw.stop() に任せる
-            # （Playwright は自分が起動したブラウザを終了させる）
-            if browser is not None:
-                try:
-                    await browser.close()
-                except Exception:
-                    logger.exception("Cleanup: error closing browser for %s", session_id)
-            try:
-                await pw.stop()
-            except Exception:
-                logger.exception("Cleanup: error stopping playwright for %s", session_id)
+            # 起動・最初のページの作成・移動のどこで失敗・取り消されても、ブラウザとドライバを止め、起動の前後で増えた
+            # Chromium の PID を刈り取る（成功したときの stop() と同じ方針。同じ時に別のところで起動した Chromium も
+            # 差分に入りうるのは既存の限界）。もう一度取り消されても最後まで進むよう shield する
+            await asyncio.shield(_discard_launch(session_id, browser, pw, pids_before))
             raise
-        try:
-            await page.goto(url, wait_until="domcontentloaded")
-        except Exception as e:
-            logger.error("Failed to navigate to %s: %s", url, e)
-            try:
-                await browser.close()
-            except Exception:
-                pass
-            try:
-                await pw.stop()
-            except Exception:
-                pass
-            await _reap_chrome_pids(_snapshot_chrome_pids() - pids_before)
-            raise RuntimeError(f"URL '{url}' を開けませんでした: {e}") from e
 
         chrome_pids = _snapshot_chrome_pids() - pids_before
         logger.info(
