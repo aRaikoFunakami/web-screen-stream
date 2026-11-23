@@ -47,7 +47,7 @@ class StreamConfig:
 
 # ホスト名（英数字・ハイフン・ドット）か IP の直書き（IPv6 は [] の中身）だけ。「,」「;」や空白は --proxy-server で
 # 複数のプロキシの区切りになり、強制のプロキシが外れた先に代わりに繋がりうる
-_HOST_RE = re.compile(r"[A-Za-z0-9.-]+|[0-9A-Fa-f:.]+")
+_HOST_RE = re.compile(r"[A-Za-z0-9._-]+|[0-9A-Fa-f:.]+")  # _ は compose のコンテナ名などで使う
 
 
 class ProxyConfigError(ValueError):
@@ -65,9 +65,11 @@ def check_proxy(proxy: object) -> dict[str, str]:
         port = url.port  # 範囲外のポートは ValueError
     except ValueError:
         raise ProxyConfigError("StreamConfig.proxy の server の形が崩れています") from None
-    if url.scheme not in ("http", "https") or not url.hostname or not _HOST_RE.fullmatch(url.hostname) or port == 0:
+    if url.scheme not in ("http", "https"):
         # SOCKS は Playwright が認証を扱えず起動で失敗するので、http(s) の URL だけを受け付ける（設定の時点で拒む）
         raise ProxyConfigError("StreamConfig.proxy の server は http:// か https:// の URL にしてください")
+    if not url.hostname or not _HOST_RE.fullmatch(url.hostname) or port == 0:
+        raise ProxyConfigError("StreamConfig.proxy の server のホストかポートが正しくありません")
     if url.username or url.password or url.path not in ("", "/") or url.query or url.fragment:
         # Playwright は server を「スキーム://ホスト:ポート」に作り直し、残りを黙って捨てる。認証は username・password に書く
         raise ProxyConfigError("StreamConfig.proxy の server には、スキーム・ホスト・ポートだけを書いてください"

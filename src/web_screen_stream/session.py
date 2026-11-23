@@ -20,7 +20,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
-from web_screen_stream.config import StreamConfig, check_proxy
+from web_screen_stream.config import ProxyConfigError, StreamConfig, check_proxy
 from web_screen_stream.input import ControlChannel, XTestInjector
 from web_screen_stream.ffmpeg_source import FFmpegSource
 from web_screen_stream.h264_extractor import H264UnitExtractor
@@ -449,6 +449,9 @@ class SessionManager:
 
             if config is None:
                 config = StreamConfig()
+            if config.proxy is not None and not url:
+                # ブラウザを起動しない（url 無し）と proxy は効かない。黙って無視せず、表示の確保の前に拒む
+                raise ProxyConfigError("StreamConfig.proxy は、ブラウザを起動する（url を渡す）create() でだけ使えます")
 
             display = None
             pw = None
@@ -700,6 +703,8 @@ class SessionManager:
         try:
             from playwright.async_api import async_playwright
         except ImportError:
+            if config.proxy is not None:  # proxy を求められたのにブラウザを起動できない。黙って続けない
+                raise ProxyConfigError("Playwright が無いので、proxy を通したブラウザを起動できません") from None
             logger.warning("Playwright not available, skipping browser launch")
             return (None, None, None, set())
 

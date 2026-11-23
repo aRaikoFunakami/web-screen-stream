@@ -520,3 +520,21 @@ async def test_launch_rechecks_proxy_before_starting_playwright(monkeypatch):
     with pytest.raises(ProxyConfigError):
         await SessionManager()._launch_browser("a", c, "about:blank")
     assert started == []
+
+
+def test_proxy_host_may_contain_underscore():
+    from web_screen_stream import StreamConfig
+
+    assert StreamConfig(proxy={"server": "http://egress_proxy:3128"}).proxy == {"server": "http://egress_proxy:3128"}
+
+
+async def test_proxy_without_url_is_rejected_before_allocating_display():
+    """ブラウザを起動しない create() で proxy を渡しても、黙って無視せず拒む（表示を確保する前に）。"""
+    from web_screen_stream import ProxyConfigError, StreamConfig
+
+    class FakeXvfb:
+        async def allocate(self, w, h):
+            raise AssertionError("表示を確保しない")
+
+    with pytest.raises(ProxyConfigError):
+        await SessionManager(xvfb_manager=FakeXvfb()).create("p", StreamConfig(proxy={"server": "http://127.0.0.1:1"}))
