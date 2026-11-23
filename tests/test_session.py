@@ -468,7 +468,9 @@ async def test_launch_passes_proxy_only_when_set(monkeypatch):
 @pytest.mark.parametrize("proxy", [{}, {"server": ""}, {"server": 123}, "http://127.0.0.1:1",
                                    {"server": "http://127.0.0.1:1", "bypass": "*.corp"},
                                    {"server": "http://127.0.0.1:1", "pasword": "x"},
-                                   {"server": "http://127.0.0.1:1", "username": 1}])
+                                   {"server": "http://127.0.0.1:1", "username": 1},
+                                   {"server": "socks5://127.0.0.1:1080", "username": "u", "password": "p"},
+                                   {"server": "127.0.0.1:8899"}, {"server": "http://127.0.0.1:99999"}])
 def test_proxy_must_have_server_and_no_bypass(proxy):
     """空の proxy で黙ってプロキシ無しに起動したり、bypass で強制のプロキシを抜けたりしない。"""
     from web_screen_stream.config import StreamConfig

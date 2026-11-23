@@ -440,6 +440,7 @@ class SessionManager:
 
         Raises:
             ValueError: 既に同じ session_id が存在する場合
+            ProxyConfigError: config.proxy が強制のプロキシとして使えない（ValueError の下位。区別するなら先に受ける）
             RuntimeError: Xvfb 起動失敗、ブラウザ起動失敗
         """
         async with self._lock:

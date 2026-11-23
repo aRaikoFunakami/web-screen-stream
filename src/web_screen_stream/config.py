@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 
 @dataclass
@@ -48,11 +49,19 @@ class ProxyConfigError(ValueError):
 
 
 def check_proxy(proxy: object) -> dict[str, str]:
-    """強制のプロキシとして使える形か確かめて写しを返す。server（空でない文字列）は必須。使える項目は server・username・password
+    """強制のプロキシとして使える形か確かめて写しを返す。server（http/https の URL）は必須。使える項目は server・username・password
     だけで、bypass は拒む。Playwright は環境変数 PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK があると <-loopback> を
     付けず、localhost がプロキシの外へ出るので、そのときも拒む。起動の直前にも呼ぶ（StreamConfig は作った後に変えられるため）。"""
     if not isinstance(proxy, dict) or not isinstance(proxy.get("server"), str) or not proxy["server"]:
         raise ProxyConfigError("StreamConfig.proxy は server（空でない文字列）を持つ dict にしてください")
+    try:
+        url = urlsplit(proxy["server"])
+        port_ok = url.port is not None or url.scheme in ("http", "https")  # 範囲外のポートは .port が ValueError
+    except ValueError:
+        port_ok = False
+    if url.scheme not in ("http", "https") or not url.hostname or not port_ok:
+        # SOCKS は Playwright が認証を扱えず起動で失敗するので、http(s) の URL だけを受け付ける（設定の時点で拒む）
+        raise ProxyConfigError("StreamConfig.proxy の server は http:// か https:// の URL にしてください")
     if "bypass" in proxy:
         raise ProxyConfigError("StreamConfig.proxy の bypass は使えません（強制のプロキシを抜ける穴になるため）")
     unknown = set(proxy) - {"server", "username", "password"}
