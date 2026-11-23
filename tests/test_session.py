@@ -389,3 +389,158 @@ async def _subscribe_with_timeout(
         pass
     finally:
         await gen.aclose()
+
+
+# ============================================================
+# 起動の設定（proxy・Xvfb で割り当てた display）
+# ============================================================
+
+
+@pytest.fixture(autouse=True)
+def _no_forced_loopback_bypass(monkeypatch):
+    """CI の環境に PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK があっても、proxy のテストを揺らさない。"""
+    monkeypatch.delenv("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK", raising=False)
+
+
+async def test_create_with_xvfb_keeps_config_fields(monkeypatch):
+    """Xvfb の割り当てで display を差し替えても、draw_mouse・proxy などの項目を落とさない。"""
+    from web_screen_stream.config import StreamConfig
+
+    class FakeXvfb:
+        async def allocate(self, w, h):
+            return ":101"
+
+        async def release(self, display):
+            pass
+
+    launched = []
+
+    async def fake_launch(self, session_id, config, url):
+        launched.append(config)
+        return (None, None, None, set())
+
+    async def fake_start(self):
+        return None
+
+    monkeypatch.setattr(SessionManager, "_launch_browser", fake_launch)
+    monkeypatch.setattr(BrowserStreamSession, "start", fake_start)
+    mgr = SessionManager(xvfb_manager=FakeXvfb())
+    proxy = {"server": "http://127.0.0.1:8899"}
+    await mgr.create("s", StreamConfig(draw_mouse=True, proxy=proxy), url="about:blank")
+    assert launched[0].display == ":101"
+    assert launched[0].draw_mouse is True and launched[0].proxy == proxy
+
+
+async def test_launch_passes_proxy_only_when_set(monkeypatch):
+    """proxy は Playwright の launch(proxy=...) に渡す（--proxy-server を args に足すと <-loopback> が付かない）。"""
+    import playwright.async_api as pa
+
+    from web_screen_stream.config import StreamConfig
+
+    calls = []
+
+    class _Page:
+        async def goto(self, *a, **k):
+            return None
+
+    class _Browser:
+        async def new_page(self, **k):
+            return _Page()
+
+    class _Chromium:
+        async def launch(self, **kw):
+            calls.append(kw)
+            return _Browser()
+
+    class _PW:
+        chromium = _Chromium()
+
+    class _Starter:
+        async def start(self):
+            return _PW()
+
+    monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
+    mgr = SessionManager()
+    await mgr._launch_browser("a", StreamConfig(), "about:blank")
+    await mgr._launch_browser("b", StreamConfig(proxy={"server": "http://127.0.0.1:1"}), "about:blank")
+    assert "proxy" not in calls[0]
+    assert calls[1]["proxy"] == {"server": "http://127.0.0.1:1"}
+    assert not any(a.startswith("--proxy") for a in calls[1]["args"])
+    # WebRTC の UDP もプロキシの外へ出さない（proxy を通すときだけ）
+    webrtc = "--webrtc-ip-handling-policy=disable_non_proxied_udp"
+    assert webrtc not in calls[0]["args"] and webrtc in calls[1]["args"]
+
+
+@pytest.mark.parametrize("proxy", [{}, {"server": ""}, {"server": 123}, "http://127.0.0.1:1",
+                                   {"server": "http://127.0.0.1:1", "bypass": "*.corp"},
+                                   {"server": "http://127.0.0.1:1", "pasword": "x"},
+                                   {"server": "http://127.0.0.1:1", "username": 1},
+                                   {"server": "socks5://127.0.0.1:1080", "username": "u", "password": "p"},
+                                   {"server": "127.0.0.1:8899"}, {"server": "http://127.0.0.1:99999"},
+                                   {"server": "http://[::1"}, {"server": "http://u:p@127.0.0.1:1"},
+                                   {"server": "http://127.0.0.1:1/x"}, {"server": "http://127.0.0.1:0"},
+                                   {"server": "http://127.0.0.1:1", 1: "a", "b": "c"},
+                                   {"server": "http://filter-proxy,other-host:"}, {"server": "http://a;b:1"}])
+def test_proxy_must_have_server_and_no_bypass(proxy):
+    """空の proxy で黙ってプロキシ無しに起動したり、bypass で強制のプロキシを抜けたりしない。誤りは必ず ProxyConfigError。"""
+    from web_screen_stream import ProxyConfigError, StreamConfig
+
+    with pytest.raises(ProxyConfigError):
+        StreamConfig(proxy=proxy)
+
+
+def test_proxy_dict_is_copied():
+    from web_screen_stream.config import StreamConfig
+
+    p = {"server": "http://127.0.0.1:1"}
+    c = StreamConfig(proxy=p)
+    p["server"] = "http://127.0.0.1:2"
+    assert c.proxy == {"server": "http://127.0.0.1:1"}
+
+
+def test_proxy_refused_when_playwright_would_skip_loopback(monkeypatch):
+    from web_screen_stream.config import ProxyConfigError, StreamConfig
+
+    monkeypatch.setenv("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK", "1")
+    with pytest.raises(ProxyConfigError):
+        StreamConfig(proxy={"server": "http://127.0.0.1:1"})
+
+
+def test_proxy_is_not_in_repr():
+    from web_screen_stream.config import StreamConfig
+
+    c = StreamConfig(proxy={"server": "http://127.0.0.1:1", "username": "u", "password": "s3cret"})
+    assert "s3cret" not in repr(c)
+
+
+async def test_launch_rechecks_proxy_before_starting_playwright(monkeypatch):
+    """作った後に bypass を足されても、Playwright を起動する前に拒む。"""
+    import playwright.async_api as pa
+
+    from web_screen_stream.config import ProxyConfigError, StreamConfig
+
+    started = []
+    monkeypatch.setattr(pa, "async_playwright", lambda: started.append(True))
+    c = StreamConfig(proxy={"server": "http://127.0.0.1:1"})
+    c.proxy["bypass"] = "*.corp"
+    with pytest.raises(ProxyConfigError):
+        await SessionManager()._launch_browser("a", c, "about:blank")
+    assert started == []
+
+
+def test_proxy_host_may_contain_underscore():
+    from web_screen_stream import StreamConfig
+
+    assert StreamConfig(proxy={"server": "http://egress_proxy:3128"}).proxy == {"server": "http://egress_proxy:3128"}
+
+
+async def test_proxy_without_url_is_rejected_before_allocating_display():
+    """ブラウザを起動しない create() で proxy を渡しても、黙って無視せず拒む（表示を確保する前に）。"""
+    from web_screen_stream import ProxyConfigError, StreamConfig
+
+    class FakeXvfb:
+        async def allocate(self, w, h):
+            raise AssertionError("表示を確保しない")
+
+    with pytest.raises(ProxyConfigError):
+        await SessionManager(xvfb_manager=FakeXvfb()).create("p", StreamConfig(proxy={"server": "http://127.0.0.1:1"}))

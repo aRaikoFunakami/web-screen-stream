@@ -9,6 +9,7 @@ android-screen-stream の StreamSession/StreamManager と同設計。
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -19,7 +20,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
-from web_screen_stream.config import StreamConfig
+from web_screen_stream.config import ProxyConfigError, StreamConfig, check_proxy
 from web_screen_stream.input import ControlChannel, XTestInjector
 from web_screen_stream.ffmpeg_source import FFmpegSource
 from web_screen_stream.h264_extractor import H264UnitExtractor
@@ -439,6 +440,7 @@ class SessionManager:
 
         Raises:
             ValueError: 既に同じ session_id が存在する場合
+            ProxyConfigError: config.proxy が強制のプロキシとして使えない（url 無しで proxy を渡したときも）
             RuntimeError: Xvfb 起動失敗、ブラウザ起動失敗
         """
         async with self._lock:
@@ -447,6 +449,9 @@ class SessionManager:
 
             if config is None:
                 config = StreamConfig()
+            if config.proxy is not None and not url:
+                # ブラウザを起動しない（url 無し）と proxy は効かない。黙って無視せず、表示の確保の前に拒む
+                raise ProxyConfigError("StreamConfig.proxy は、ブラウザを起動する（url を渡す）create() でだけ使えます")
 
             display = None
             pw = None
@@ -457,17 +462,8 @@ class SessionManager:
                 # Phase 1: ディスプレイ確保（XvfbManager がある場合）
                 if self._xvfb:
                     display = await self._xvfb.allocate(config.width, config.height)
-                    config = StreamConfig(
-                        display=display,
-                        width=config.width,
-                        height=config.height,
-                        framerate=config.framerate,
-                        bitrate=config.bitrate,
-                        maxrate=config.maxrate,
-                        bufsize=config.bufsize,
-                        gop_size=config.gop_size,
-                        draw_mouse=config.draw_mouse,
-                    )
+                    # 項目を並べ直すと、足した項目（proxy など）が黙って落ちるので replace で display だけ変える
+                    config = dataclasses.replace(config, display=display)
 
                 # Phase 2: ブラウザ起動（url が指定された場合）
                 if url:
@@ -707,19 +703,26 @@ class SessionManager:
         try:
             from playwright.async_api import async_playwright
         except ImportError:
+            if config.proxy is not None:  # proxy を求められたのにブラウザを起動できない。黙って続けない（起動の失敗）
+                raise RuntimeError("Playwright が無いので、proxy を通したブラウザを起動できません") from None
             logger.warning("Playwright not available, skipping browser launch")
             return (None, None, None, set())
 
+        proxy = check_proxy(config.proxy) if config.proxy is not None else None  # 作った後に変えられていても確かめる
         pids_before = _snapshot_chrome_pids()
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(
             headless=False,
+            **({"proxy": proxy} if proxy else {}),
             args=[
                 f"--display={config.display}",
                 "--no-sandbox",
                 "--disable-gpu",
                 f"--window-size={config.width},{config.height}",
                 "--window-position=0,0",
+                # proxy を通すときは、WebRTC の UDP（STUN・ICE）もプロキシの外へ直接出さない。
+                # --force-webrtc-ip-handling-policy は効かない（実 Chromium で ICE の候補を集めて確かめた）
+                *(["--webrtc-ip-handling-policy=disable_non_proxied_udp"] if proxy else []),
             ],
         )
         page = await browser.new_page(
