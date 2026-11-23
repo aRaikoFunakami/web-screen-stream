@@ -1,6 +1,6 @@
 """ストリーミング設定."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -17,6 +17,7 @@ class StreamConfig:
         bufsize: H.264 バッファサイズ (例: "500k")
         gop_size: GOP サイズ (フレーム数, Late-join 間隔)
         draw_mouse: マウスカーソルを映像に描くか（操作チャネルで人が操作するときに True。既定は描かない）
+        chromium_args: Chromium の起動引数に足すもの（既定の引数の後ろに付ける。既定は無し）
     """
 
     display: str = ":99"
@@ -28,3 +29,4 @@ class StreamConfig:
     bufsize: str = "500k"
     gop_size: int = 10
     draw_mouse: bool = False
+    chromium_args: tuple[str, ...] = field(default_factory=tuple)

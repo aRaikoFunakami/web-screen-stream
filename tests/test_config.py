@@ -28,3 +28,40 @@ def test_stream_config_custom():
     assert config.height == 1080
     assert config.framerate == 10
     assert config.bitrate == "1000k"
+
+
+async def test_chromium_args_are_appended_to_launch(monkeypatch):
+    """chromium_args は既定の引数の後ろに付けて Chromium に渡す（既定は何も足さない）。"""
+    import playwright.async_api as pa
+
+    from web_screen_stream.session import SessionManager
+
+    launched: list[list[str]] = []
+
+    class _Page:
+        async def goto(self, *a, **k):
+            return None
+
+    class _Browser:
+        async def new_page(self, **k):
+            return _Page()
+
+    class _Chromium:
+        async def launch(self, headless, args):
+            launched.append(args)
+            return _Browser()
+
+    class _PW:
+        chromium = _Chromium()
+
+    class _Starter:
+        async def start(self):
+            return _PW()
+
+    monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
+    mgr = SessionManager()
+    await mgr._launch_browser("s", StreamConfig(), "about:blank")
+    await mgr._launch_browser("s", StreamConfig(chromium_args=("--disable-features=X",)), "about:blank")
+    assert "--disable-features=X" not in launched[0]
+    assert launched[1][-1] == "--disable-features=X"
+    assert launched[1][:-1] == launched[0]

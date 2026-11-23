@@ -720,6 +720,7 @@ class SessionManager:
                 "--disable-gpu",
                 f"--window-size={config.width},{config.height}",
                 "--window-position=0,0",
+                *config.chromium_args,
             ],
         )
         page = await browser.new_page(
