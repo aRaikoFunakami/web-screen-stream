@@ -671,3 +671,42 @@ async def test_create_cancelled_during_stream_start_stops_the_stream(monkeypatch
         await task
     await asyncio.sleep(0.05)
     assert stopped == ["s2"]
+
+
+async def test_create_cleanup_finishes_even_if_cancelled_again(monkeypatch):
+    """片付けの途中でもう一度取り消されても、ロックを持ったまま片付けを終えてから戻る（後の create の登録を消さない）。"""
+    from web_screen_stream.config import StreamConfig
+
+    order = []
+
+    async def fake_launch(self, session_id, config, url):
+        return (None, None, None, set())
+
+    async def slow_start(self):
+        await asyncio.sleep(10)
+
+    async def slow_stop(self):
+        order.append("cleanup-start")
+        await asyncio.sleep(0.2)
+        order.append("cleanup-end")
+
+    monkeypatch.setattr(SessionManager, "_launch_browser", fake_launch)
+    monkeypatch.setattr(BrowserStreamSession, "start", slow_start)
+    monkeypatch.setattr(BrowserStreamSession, "stop", slow_stop)
+    task = asyncio.ensure_future(SessionManager().create("s3", StreamConfig(), url="about:blank"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    task.cancel()  # 片付けの途中でもう一度
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert order == ["cleanup-start", "cleanup-end"]  # 戻った時点で片付けは終わっている
+
+
+def test_proxy_is_not_in_repr_and_has_its_own_error():
+    from web_screen_stream.config import ProxyConfigError, StreamConfig
+
+    c = StreamConfig(proxy={"server": "http://127.0.0.1:1", "username": "u", "password": "s3cret"})
+    assert "s3cret" not in repr(c)
+    with pytest.raises(ProxyConfigError):
+        StreamConfig(proxy={"server": "http://127.0.0.1:1", "bypass": "x"})

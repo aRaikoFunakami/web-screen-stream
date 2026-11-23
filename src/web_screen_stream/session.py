@@ -411,6 +411,17 @@ async def _close_browser(session_id: str, browser, pw) -> None:
             logger.exception("Cleanup: error stopping playwright for %s", session_id)
 
 
+async def _finish_cleanup(coro) -> None:
+    """片付けを最後まで行う。途中で取り消されても待ち続ける（呼び出し側は、この後で元の例外・取り消しを投げ直す）。
+    shield だけだと、取り消されたときに片付けが裏で走り続け、ロックの外で次の create() の登録を消しうる。"""
+    task = asyncio.ensure_future(coro)  # 待っている間は、このローカル変数が強い参照になる
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+
+
 async def _discard_launch(session_id: str, browser, pw, pids_before: set[int]) -> None:
     await _close_browser(session_id, browser, pw)
     await _reap_chrome_pids(_snapshot_chrome_pids() - pids_before)
@@ -458,6 +469,7 @@ class SessionManager:
 
         Raises:
             ValueError: 既に同じ session_id が存在する場合
+            ProxyConfigError: config.proxy が強制のプロキシとして使えない（ValueError の下位。先に受けること）
             RuntimeError: Xvfb 起動失敗、ブラウザ起動失敗
         """
         async with self._lock:
@@ -501,8 +513,8 @@ class SessionManager:
 
             except BaseException:
                 # 途中で取り消されたときも、作りかけの FFmpeg・ブラウザ・display を残さない。片付けの途中でもう一度
-                # 取り消されても最後まで進むよう、shield した別のタスクで行う
-                await asyncio.shield(self._discard_partial(session_id, session, browser, pw, chrome_pids, display))
+                # 取り消されても、ロックを持ったまま最後まで終えてから投げ直す
+                await _finish_cleanup(self._discard_partial(session_id, session, browser, pw, chrome_pids, display))
                 raise
 
     async def _discard_partial(self, session_id, session, browser, pw, chrome_pids, display) -> None:
@@ -718,9 +730,10 @@ class SessionManager:
 
         proxy = check_proxy(config.proxy) if config.proxy is not None else None  # 作った後に変えられていても確かめる
         pids_before = _snapshot_chrome_pids()
-        pw = await async_playwright().start()
+        pw = None
         browser = None
         try:
+            pw = await async_playwright().start()
             browser = await pw.chromium.launch(
                 headless=False,
                 **({"proxy": proxy} if proxy else {}),
@@ -746,8 +759,8 @@ class SessionManager:
         except BaseException:
             # 起動・最初のページの作成・移動のどこで失敗・取り消されても、ブラウザとドライバを止め、起動の前後で増えた
             # Chromium の PID を刈り取る（成功したときの stop() と同じ方針。同じ時に別のところで起動した Chromium も
-            # 差分に入りうるのは既存の限界）。もう一度取り消されても最後まで進むよう shield する
-            await asyncio.shield(_discard_launch(session_id, browser, pw, pids_before))
+            # 差分に入りうるのは既存の限界。#12）。もう一度取り消されても最後まで終えてから投げ直す
+            await _finish_cleanup(_discard_launch(session_id, browser, pw, pids_before))
             raise
 
         chrome_pids = _snapshot_chrome_pids() - pids_before
