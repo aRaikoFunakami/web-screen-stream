@@ -373,7 +373,7 @@ def _pid_alive(pid: int) -> bool:
 
 async def _reap_tagged(tag: str) -> None:
     """目印 `tag` を持つプロセスを、刈り取りの時点で探して刈り取る（起動時に PID を覚えない = PID の再利用に強い）."""
-    await _reap_chrome_pids(_tagged_pids(tag))
+    await _reap_chrome_pids(await asyncio.to_thread(_tagged_pids, tag))  # /proc の走査でループを止めない
 
 
 async def _reap_chrome_pids(pids: set[int]) -> None:
@@ -808,11 +808,10 @@ class SessionManager:
             raise
 
         logger.info(
-            "Browser launched for session %s: %s (%dx%d, chrome_pids=%d)",
+            "Browser launched for session %s: %s (%dx%d)",
             session_id,
             url,
             config.width,
             config.height,
-            len(_tagged_pids(browser_tag)),
         )
         return (pw, browser, page, browser_tag)
