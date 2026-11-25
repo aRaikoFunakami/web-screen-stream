@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `SessionManager` が Chromium を刈り取るとき、起動の前後で増えた `chrome*` の PID の差分ではなく、起動ごとに環境変数で渡した一意な目印（`WSS_BROWSER_TAG`）を持つプロセスだけを対象にした。同時に起動した別の Chromium（別の `SessionManager`・別のプロセス）や別ユーザーのプロセスを止めない。親が PID 1 に付け替わった `chrome_crashpad` も、環境変数が引き継がれるので引き続き刈り取る（#12）
+
 ## 1.1.0 (2026-11-25)
 
 ### Added

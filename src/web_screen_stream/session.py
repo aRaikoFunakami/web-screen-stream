@@ -16,6 +16,7 @@ import os
 import signal
 import threading
 import time
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
@@ -315,27 +316,48 @@ class BrowserStreamSession:
 _CHROME_REAP_SIGTERM_WAIT = 2.0
 
 
-def _snapshot_chrome_pids() -> set[int]:
-    """/proc から chrome 系プロセス（chrome, chrome_crashpad 等）の PID 集合を取得する.
+# 起動した Chromium に渡す、起動ごとに一意な目印の環境変数名。子（renderer・crashpad 等）は環境を引き継ぐ
+_BROWSER_TAG_ENV = "WSS_BROWSER_TAG"
 
+
+def _tagged_pids(tag: str, proc: str = "/proc") -> set[int]:
+    """環境変数に目印 `tag` を持つ PID（= その起動で生まれた Chromium の全プロセス）を返す.
+
+    chrome_crashpad は起動直後から親が PID 1 で、ppid の木ではブラウザの子孫に入らない。
+    環境変数は fork・exec で引き継がれ、reparent されても残るので、これで自分のものだけを見分ける。
+    同時に起動した別の Chromium（別の SessionManager・別のプロセス）は目印が違うので入らない。
+    別ユーザーの PID は含めない（kill で PermissionError を出さない）。
     Linux 専用。/proc が無い環境（macOS 開発機など）では空集合を返す。
+    `proc` はテストが偽の /proc に差し替えるための引数。
     """
-    pids: set[int] = set()
+    needle = f"\0{_BROWSER_TAG_ENV}={tag}\0".encode()  # 先頭の \0 で、末尾が同じ別名の変数を拾わない
     try:
-        entries = os.listdir("/proc")
+        entries = os.listdir(proc)
     except FileNotFoundError:
-        return pids
+        return set()
+    pids: set[int] = set()
     for entry in entries:
         if not entry.isdigit():
             continue
         try:
-            with open(f"/proc/{entry}/comm") as f:
-                comm = f.read().strip()
-        except OSError:
+            with open(f"{proc}/{entry}/environ", "rb") as f:
+                environ = b"\0" + f.read() + b"\0"
+        except OSError:  # 読む前に終了した・権限が無い（別ユーザー）
             continue
-        if comm.startswith("chrome"):
+        if needle in environ and _owned_by_me(entry, proc):
             pids.add(int(entry))
     return pids
+
+
+def _owned_by_me(pid: str, proc: str) -> bool:
+    try:
+        with open(f"{proc}/{pid}/status") as f:
+            for line in f:
+                if line.startswith("Uid:"):
+                    return int(line.split()[1]) == os.getuid()  # 実 UID
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
 
 
 def _pid_alive(pid: int) -> bool:
@@ -349,12 +371,17 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+async def _reap_tagged(tag: str) -> None:
+    """目印 `tag` を持つプロセスを、刈り取りの時点で探して刈り取る（起動時に PID を覚えない = PID の再利用に強い）."""
+    await _reap_chrome_pids(_tagged_pids(tag))
+
+
 async def _reap_chrome_pids(pids: set[int]) -> None:
     """browser.close() で終了しなかった chrome 系プロセスを個別に刈り取る.
 
     crashpad handler はブラウザ本体への CDP close に反応せず、コンテナの
     PID 1（本プロセス）に reparent されたまま生き残る設計のため、
-    `_launch_browser` が launch 前後の /proc 差分で記録した PID を対象に
+    `_tagged_pids` が見つけた、その起動の Chromium の PID を対象に
     SIGTERM → 猶予 → SIGKILL する。Playwright は Node driver 経由で
     Chromium を起動しており、Python 側はプロセスグループを所有していない
     ため killpg ではなく PID 単位で kill する。
@@ -468,7 +495,7 @@ class SessionManager:
         self._sessions: dict[str, BrowserStreamSession] = {}
         self._browsers: dict[str, tuple[Any, Any, Any]] = {}
         # (playwright_instance, browser, page)
-        self._browser_pids: dict[str, set[int]] = {}  # session_id → chrome系PID集合
+        self._browser_tags: dict[str, str] = {}  # session_id → 起動した Chromium の目印
         self._displays: dict[str, str] = {}  # session_id → display
         self._xvfb = xvfb_manager
         self._lock = asyncio.Lock()
@@ -514,7 +541,7 @@ class SessionManager:
             display = None
             session = None
             browser_info = None
-            chrome_pids: set[int] = set()
+            browser_tag = ""
 
             try:
                 # Phase 1: ディスプレイ確保（XvfbManager がある場合）
@@ -525,13 +552,13 @@ class SessionManager:
 
                 # Phase 2: ブラウザ起動（url が指定された場合）。失敗・取り消しの片付けは _launch_browser が行う
                 if url:
-                    pw, browser, page, chrome_pids = await self._launch_browser(
+                    pw, browser, page, browser_tag = await self._launch_browser(
                         session_id, config, url
                     )
                     if pw is not None:
                         browser_info = (pw, browser, page)
                         self._browsers[session_id] = browser_info
-                        self._browser_pids[session_id] = chrome_pids
+                        self._browser_tags[session_id] = browser_tag
 
                 # Phase 3: FFmpeg + ストリーミング開始
                 session = BrowserStreamSession(session_id, config, url=url)
@@ -545,8 +572,8 @@ class SessionManager:
 
             except BaseException:  # 取り消し（CancelledError）でも資源を残さない
                 self._browsers.pop(session_id, None)
-                self._browser_pids.pop(session_id, None)
-                steps = self._teardown_steps(session, browser_info, chrome_pids, display)
+                self._browser_tags.pop(session_id, None)
+                steps = self._teardown_steps(session, browser_info, browser_tag, display)
                 await _cleanup(steps)  # 期限付き。取り消された場合は片付けの後に CancelledError が届く
                 raise
 
@@ -554,7 +581,7 @@ class SessionManager:
         self,
         session: BrowserStreamSession | None,
         browser_info: tuple[Any, Any, Any] | None,
-        chrome_pids: set[int] | None,
+        browser_tag: str | None,
         display: str | None,
         controller: object | None = None,
     ) -> list[_CleanupStep]:
@@ -570,8 +597,8 @@ class SessionManager:
             if browser is not None:
                 steps.append(("browser.close", browser.close, _T_CLOSE))
             steps.append(("pw.stop", pw.stop, _T_CLOSE))
-        if chrome_pids:  # crashpad handler 等、CDP close に反応せず生き残るプロセスを刈り取る
-            steps.append(("reap", lambda: _reap_chrome_pids(chrome_pids), _T_REAP))
+        if browser_tag:  # crashpad handler 等、CDP close に反応せず生き残るプロセスを刈り取る
+            steps.append(("reap", lambda: _reap_tagged(browser_tag), _T_REAP))
         if display and self._xvfb:
             xvfb = self._xvfb
             steps.append(("display.release", lambda: xvfb.release(display), _T_RELEASE))
@@ -599,7 +626,7 @@ class SessionManager:
                 raise KeyError(f"Session {session_id} not found")
 
             browser_info = self._browsers.pop(session_id, None)
-            chrome_pids = self._browser_pids.pop(session_id, None)
+            browser_tag = self._browser_tags.pop(session_id, None)
             with self._control_lock:  # open_control(別スレッド)の予約・確定と排他にする
                 controller = self._controllers.pop(session_id, None)
             display = self._displays.pop(session_id, None)
@@ -607,7 +634,7 @@ class SessionManager:
         # ロック外で停止（I/O 待ちが長い可能性）。取り消されても全段を期限付きで完走させる
         # 0. 操作チャネルを閉じる(同じディスプレイを次のセッションが使っても、古い操作が届かないように)
         # 1. FFmpeg + subscriber 停止  2. Playwright 解放  3. Xvfb + Fluxbox 解放
-        await _cleanup(self._teardown_steps(session, browser_info, chrome_pids, display, controller))
+        await _cleanup(self._teardown_steps(session, browser_info, browser_tag, display, controller))
 
         logger.info("Session %s stopped and removed", session_id)
 
@@ -722,16 +749,16 @@ class SessionManager:
 
     async def _launch_browser(
         self, session_id: str, config: StreamConfig, url: str
-    ) -> tuple[Any, Any, Any, set[int]]:
+    ) -> tuple[Any, Any, Any, str]:
         """Playwright Chromium を起動してページを開く.
 
-        launch 前後で /proc の chrome 系 PID を差分取得し、browser.close()
-        では終了しない crashpad handler 等を後で個別に刈り取れるようにする
-        （`_reap_chrome_pids` 参照）。
+        起動ごとに一意な目印を環境変数で渡し、browser.close() では終了しない
+        crashpad handler 等を、後で自分の分だけ刈り取れるようにする
+        （`_tagged_pids` / `_reap_chrome_pids` 参照）。
 
         Returns:
-            (playwright_instance, browser, page, chrome_pids) のタプル
-            Playwright が利用不可の場合は (None, None, None, set())
+            (playwright_instance, browser, page, browser_tag) のタプル
+            Playwright が利用不可の場合は (None, None, None, "")
         """
         try:
             from playwright.async_api import async_playwright
@@ -739,15 +766,16 @@ class SessionManager:
             if config.proxy is not None:  # proxy を求められたのにブラウザを起動できない。黙って続けない（起動の失敗）
                 raise RuntimeError("Playwright が無いので、proxy を通したブラウザを起動できません") from None
             logger.warning("Playwright not available, skipping browser launch")
-            return (None, None, None, set())
+            return (None, None, None, "")
 
         proxy = check_proxy(config.proxy) if config.proxy is not None else None  # 作った後に変えられていても確かめる
-        pids_before = _snapshot_chrome_pids()
+        browser_tag = uuid.uuid4().hex
         pw = browser = None
         try:
             pw = await async_playwright().start()
             browser = await pw.chromium.launch(
                 headless=False,
+                env={**os.environ, _BROWSER_TAG_ENV: browser_tag},  # 指定すると既定の環境を置き換えるので、足して渡す
                 **({"proxy": proxy} if proxy else {}),
                 args=[
                     f"--display={config.display}",
@@ -775,21 +803,16 @@ class SessionManager:
                 steps.append(("browser.close", browser.close, _T_CLOSE))
             if pw is not None:
                 steps.append(("pw.stop", pw.stop, _T_CLOSE))
-
-                async def reap() -> None:
-                    await _reap_chrome_pids(_snapshot_chrome_pids() - pids_before)
-
-                steps.append(("reap", reap, _T_REAP))
+                steps.append(("reap", lambda: _reap_tagged(browser_tag), _T_REAP))
             await _cleanup(steps)
             raise
 
-        chrome_pids = _snapshot_chrome_pids() - pids_before
         logger.info(
             "Browser launched for session %s: %s (%dx%d, chrome_pids=%d)",
             session_id,
             url,
             config.width,
             config.height,
-            len(chrome_pids),
+            len(_tagged_pids(browser_tag)),
         )
-        return (pw, browser, page, chrome_pids)
+        return (pw, browser, page, browser_tag)
