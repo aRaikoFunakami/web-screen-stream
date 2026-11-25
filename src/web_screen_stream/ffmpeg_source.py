@@ -49,7 +49,7 @@ class FFmpegSource:
             "-f", "x11grab",
             "-video_size", f"{c.width}x{c.height}",
             "-framerate", str(c.framerate),
-            "-draw_mouse", "0",
+            "-draw_mouse", "1" if c.draw_mouse else "0",
             "-i", c.display,
             "-c:v", "libx264",
             "-preset", "ultrafast",

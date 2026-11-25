@@ -84,9 +84,13 @@ class StreamConfig:
     display: str = ":99"
     width: int = 1280
     height: int = 720
-  framerate: int = 15
+    framerate: int = 15
     bitrate: str = "500k"
     maxrate: str = "800k"
+    bufsize: str = "500k"
+    gop_size: int = 10
+    draw_mouse: bool = False                 # 操作チャネルで人が操作するときに True（カーソルを映像に描く）
+    proxy: dict[str, str] | None = None      # 自前起動の Chromium を launch(proxy=...) でプロキシに通す
 ```
 
 ### Step 1 と Step 2 の違い
