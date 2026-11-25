@@ -16,7 +16,7 @@ import os
 import signal
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -372,6 +372,8 @@ async def _reap_chrome_pids(pids: set[int]) -> None:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
+        except OSError:  # PermissionError 等。他の PID と後続の段を止めない
+            logger.exception("Cannot SIGTERM leftover chrome process PID=%d", pid)
 
     await asyncio.sleep(_CHROME_REAP_SIGTERM_WAIT)
 
@@ -382,6 +384,8 @@ async def _reap_chrome_pids(pids: set[int]) -> None:
                 logger.warning("Force-killed leftover chrome process PID=%d", pid)
             except ProcessLookupError:
                 pass
+            except OSError:
+                logger.exception("Cannot SIGKILL leftover chrome process PID=%d", pid)
 
     # reparent の完了を少し待って回収（自分の子でなければ ChildProcessError → 諦める）
     for _ in range(10):
@@ -396,6 +400,60 @@ async def _reap_chrome_pids(pids: set[int]) -> None:
         if not survivors:
             break
         await asyncio.sleep(0.1)
+
+
+# 片付けの各段の期限（秒）。各段の内部の期限より長くする
+# （FFmpegSource.stop は SIGTERM 5 秒→SIGKILL、_reap_chrome_pids は約 3 秒かかる。
+#  短くすると、内部の SIGKILL へ進む前に取り消してしまう）。
+_T_SESSION = 10.0
+_T_CLOSE = 5.0
+_T_REAP = 10.0
+_T_RELEASE = 20.0
+_TIMEOUT_SCALE = 1.0  # テストが期限を縮めるための倍率
+
+_CleanupStep = tuple[str, Callable[[], Awaitable[Any]], float]
+
+
+def _consume_exception(task: asyncio.Future) -> None:
+    if not task.cancelled():
+        task.exception()  # 期限切れで見捨てた段の例外を回収し、未取得の警告を出さない
+
+
+async def _run_steps(steps: list[_CleanupStep]) -> None:
+    """各段を期限付きで順に実行する. 失敗・期限切れは記録して次の段へ進む."""
+    for name, fn, timeout in steps:
+        task = asyncio.ensure_future(fn())
+        done, _ = await asyncio.wait({task}, timeout=timeout * _TIMEOUT_SCALE)
+        if not done:
+            # 返らない段は待たずに次へ進む（強制終了の段が後ろに控えている）
+            task.cancel()
+            task.add_done_callback(_consume_exception)
+            logger.error("Cleanup step %s timed out after %.1fs", name, timeout * _TIMEOUT_SCALE)
+            continue
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.warning("Cleanup step %s was cancelled", name)
+        except Exception:
+            logger.exception("Cleanup step %s failed", name)
+
+
+async def _cleanup(steps: list[_CleanupStep]) -> None:
+    """片付けを、呼び出し側の取り消しから守りつつ、期限付きで行う.
+
+    片付けは別タスクで走らせる。待っている間に取り消されても止めず（各段が有界なので有限）、
+    終わってから CancelledError を投げ直す（取り消しを握りつぶさない）。
+    """
+    task = asyncio.ensure_future(_run_steps(steps))
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError as e:
+            cancelled = cancelled or e
+    task.result()
+    if cancelled is not None:
+        raise cancelled
 
 
 class SessionManager:
@@ -454,8 +512,8 @@ class SessionManager:
                 raise ProxyConfigError("StreamConfig.proxy は、ブラウザを起動する（url を渡す）create() でだけ使えます")
 
             display = None
-            pw = None
-            browser = None
+            session = None
+            browser_info = None
             chrome_pids: set[int] = set()
 
             try:
@@ -465,13 +523,14 @@ class SessionManager:
                     # 項目を並べ直すと、足した項目（proxy など）が黙って落ちるので replace で display だけ変える
                     config = dataclasses.replace(config, display=display)
 
-                # Phase 2: ブラウザ起動（url が指定された場合）
+                # Phase 2: ブラウザ起動（url が指定された場合）。失敗・取り消しの片付けは _launch_browser が行う
                 if url:
                     pw, browser, page, chrome_pids = await self._launch_browser(
                         session_id, config, url
                     )
                     if pw is not None:
-                        self._browsers[session_id] = (pw, browser, page)
+                        browser_info = (pw, browser, page)
+                        self._browsers[session_id] = browser_info
                         self._browser_pids[session_id] = chrome_pids
 
                 # Phase 3: FFmpeg + ストリーミング開始
@@ -484,34 +543,39 @@ class SessionManager:
                 logger.info("Session %s created (url=%s)", session_id, url)
                 return session
 
-            except Exception:
-                # 逆順クリーンアップ
-                if browser:
-                    try:
-                        await browser.close()
-                    except Exception:
-                        logger.exception(
-                            "Cleanup: error closing browser for %s", session_id
-                        )
-                if pw:
-                    try:
-                        await pw.stop()
-                    except Exception:
-                        logger.exception(
-                            "Cleanup: error stopping playwright for %s", session_id
-                        )
-                if chrome_pids:
-                    await _reap_chrome_pids(chrome_pids)
+            except BaseException:  # 取り消し（CancelledError）でも資源を残さない
                 self._browsers.pop(session_id, None)
                 self._browser_pids.pop(session_id, None)
-                if display and self._xvfb:
-                    try:
-                        await self._xvfb.release(display)
-                    except Exception:
-                        logger.exception(
-                            "Cleanup: error releasing display %s", display
-                        )
+                steps = self._teardown_steps(session, browser_info, chrome_pids, display)
+                await _cleanup(steps)  # 期限付き。取り消された場合は片付けの後に CancelledError が届く
                 raise
+
+    def _teardown_steps(
+        self,
+        session: BrowserStreamSession | None,
+        browser_info: tuple[Any, Any, Any] | None,
+        chrome_pids: set[int] | None,
+        display: str | None,
+        controller: object | None = None,
+    ) -> list[_CleanupStep]:
+        """create の失敗と stop が共有する、逆順の片付けの段."""
+        steps: list[_CleanupStep] = []
+        if isinstance(controller, ControlChannel):  # 接続中の予約(object)なら open_control 側が後始末する
+            # 注入中なら終わるのを待つ(イベントループは止めない)
+            steps.append(("control.close", lambda: asyncio.to_thread(controller.close), _T_SESSION))
+        if session is not None:
+            steps.append(("session.stop", session.stop, _T_SESSION))
+        if browser_info:
+            pw, browser, _page = browser_info
+            if browser is not None:
+                steps.append(("browser.close", browser.close, _T_CLOSE))
+            steps.append(("pw.stop", pw.stop, _T_CLOSE))
+        if chrome_pids:  # crashpad handler 等、CDP close に反応せず生き残るプロセスを刈り取る
+            steps.append(("reap", lambda: _reap_chrome_pids(chrome_pids), _T_REAP))
+        if display and self._xvfb:
+            xvfb = self._xvfb
+            steps.append(("display.release", lambda: xvfb.release(display), _T_RELEASE))
+        return steps
 
     async def stop(self, session_id: str) -> None:
         """セッション停止: FFmpeg 停止 + ブラウザ終了 + リソース解放.
@@ -540,46 +604,10 @@ class SessionManager:
                 controller = self._controllers.pop(session_id, None)
             display = self._displays.pop(session_id, None)
 
-        # ロック外で停止（I/O 待ちが長い可能性）
-
+        # ロック外で停止（I/O 待ちが長い可能性）。取り消されても全段を期限付きで完走させる
         # 0. 操作チャネルを閉じる(同じディスプレイを次のセッションが使っても、古い操作が届かないように)
-        if isinstance(controller, ControlChannel):  # 接続中の予約(object)なら open_control 側が後始末する
-            try:
-                await asyncio.to_thread(controller.close)  # 注入中なら終わるのを待つ(イベントループは止めない)
-            except Exception:  # X が先に落ちていても、後続のプロセス停止は必ず行う
-                logger.exception("Error closing control channel for %s", session_id)
-
-        # 1. FFmpeg + subscriber 停止
-        try:
-            await session.stop()
-        except Exception:
-            logger.exception("Error stopping session %s", session_id)
-
-        # 2. Playwright 解放
-        if browser_info:
-            pw, browser, _page = browser_info
-            try:
-                await browser.close()
-                logger.info("Browser closed for session %s", session_id)
-            except Exception:
-                logger.exception("Error closing browser for session %s", session_id)
-            try:
-                await pw.stop()
-                logger.info("Playwright stopped for session %s", session_id)
-            except Exception:
-                logger.exception(
-                    "Error stopping playwright for session %s", session_id
-                )
-            # crashpad handler 等、CDP close に反応せず生き残るプロセスを刈り取る
-            if chrome_pids:
-                await _reap_chrome_pids(chrome_pids)
-
-        # 3. Xvfb + Fluxbox 解放
-        if display and self._xvfb:
-            try:
-                await self._xvfb.release(display)
-            except Exception:
-                logger.exception("Error releasing display %s", display)
+        # 1. FFmpeg + subscriber 停止  2. Playwright 解放  3. Xvfb + Fluxbox 解放
+        await _cleanup(self._teardown_steps(session, browser_info, chrome_pids, display, controller))
 
         logger.info("Session %s stopped and removed", session_id)
 
@@ -681,11 +709,16 @@ class SessionManager:
         async with self._lock:
             session_ids = list(self._sessions.keys())
 
+        cancelled: asyncio.CancelledError | None = None
         for sid in session_ids:
             try:
                 await self.stop(sid)
+            except asyncio.CancelledError as e:  # 取り消されても残りのセッションを止めてから投げ直す
+                cancelled = cancelled or e
             except Exception:
                 logger.exception("Error stopping session %s", sid)
+        if cancelled is not None:
+            raise cancelled
 
     async def _launch_browser(
         self, session_id: str, config: StreamConfig, url: str
@@ -710,38 +743,45 @@ class SessionManager:
 
         proxy = check_proxy(config.proxy) if config.proxy is not None else None  # 作った後に変えられていても確かめる
         pids_before = _snapshot_chrome_pids()
-        pw = await async_playwright().start()
-        browser = await pw.chromium.launch(
-            headless=False,
-            **({"proxy": proxy} if proxy else {}),
-            args=[
-                f"--display={config.display}",
-                "--no-sandbox",
-                "--disable-gpu",
-                f"--window-size={config.width},{config.height}",
-                "--window-position=0,0",
-                # proxy を通すときは、WebRTC の UDP（STUN・ICE）もプロキシの外へ直接出さない。
-                # --force-webrtc-ip-handling-policy は効かない（実 Chromium で ICE の候補を集めて確かめた）
-                *(["--webrtc-ip-handling-policy=disable_non_proxied_udp"] if proxy else []),
-            ],
-        )
-        page = await browser.new_page(
-            viewport={"width": config.width, "height": config.height}
-        )
+        pw = browser = None
         try:
-            await page.goto(url, wait_until="domcontentloaded")
-        except Exception as e:
-            logger.error("Failed to navigate to %s: %s", url, e)
+            pw = await async_playwright().start()
+            browser = await pw.chromium.launch(
+                headless=False,
+                **({"proxy": proxy} if proxy else {}),
+                args=[
+                    f"--display={config.display}",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    f"--window-size={config.width},{config.height}",
+                    "--window-position=0,0",
+                    # proxy を通すときは、WebRTC の UDP（STUN・ICE）もプロキシの外へ直接出さない。
+                    # --force-webrtc-ip-handling-policy は効かない（実 Chromium で ICE の候補を集めて確かめた）
+                    *(["--webrtc-ip-handling-policy=disable_non_proxied_udp"] if proxy else []),
+                ],
+            )
+            page = await browser.new_page(
+                viewport={"width": config.width, "height": config.height}
+            )
             try:
-                await browser.close()
-            except Exception:
-                pass
-            try:
-                await pw.stop()
-            except Exception:
-                pass
-            await _reap_chrome_pids(_snapshot_chrome_pids() - pids_before)
-            raise RuntimeError(f"URL '{url}' を開けませんでした: {e}") from e
+                await page.goto(url, wait_until="domcontentloaded")
+            except Exception as e:
+                logger.error("Failed to navigate to %s: %s", url, e)
+                raise RuntimeError(f"URL '{url}' を開けませんでした: {e}") from e
+        except BaseException:
+            # 起動・new_page・移動のどこで失敗・取り消されても、持っている資源を一度だけ片付ける
+            steps: list[_CleanupStep] = []
+            if browser is not None:
+                steps.append(("browser.close", browser.close, _T_CLOSE))
+            if pw is not None:
+                steps.append(("pw.stop", pw.stop, _T_CLOSE))
+
+                async def reap() -> None:
+                    await _reap_chrome_pids(_snapshot_chrome_pids() - pids_before)
+
+                steps.append(("reap", reap, _T_REAP))
+            await _cleanup(steps)
+            raise
 
         chrome_pids = _snapshot_chrome_pids() - pids_before
         logger.info(
