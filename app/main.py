@@ -255,7 +255,7 @@ async def ws_control(websocket: WebSocket, session_id: str):
             # ponytail: 停止の検知は STOP_POLL_SEC ごとのポーリング。即時が要るなら close から Event を立てる
             done, _ = await asyncio.wait({recv}, timeout=STOP_POLL_SEC)
             if channel.closed:  # 何も送ってこないクライアントにもセッションの停止を知らせる
-                if not (done and recv.exception() is not None):  # クライアントが先に切っていたら閉じ直さない
+                if not (done and isinstance(recv.exception(), WebSocketDisconnect)):  # クライアントが先に切っていたら閉じ直さない
                     await websocket.close(code=4004, reason="Session stopped")
                 return
             if not done:
