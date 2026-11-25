@@ -160,3 +160,37 @@ async def test_each_launch_passes_a_unique_tag_and_keeps_the_environment(monkeyp
     assert all(e["WSS_TEST_MARKER"] == "kept" for e in seen)  # 環境を置き換えない
     assert TAG_ENV not in os.environ  # 自分の環境には付けない
 
+
+
+# ---------- 自力で先に終了して zombie になった子 ----------
+
+
+def test_exited_chrome_children_of_ours_are_collected(tmp_path, monkeypatch):
+    me = os.getpid()
+    for pid, comm, state, ppid in [
+        (11, "chrome_crashpad", "Z", me),  # 回収する
+        (12, "chrome_crashpad", "R", me),  # 生きている
+        (13, "chrome_crashpad", "Z", 1),  # 他人の子
+        (14, "ffmpeg", "Z", me),  # chrome ではない
+        (15, "chrome (x) y", "Z", me),  # comm に空白と ')' があっても読める
+    ]:
+        d = tmp_path / str(pid)
+        d.mkdir()
+        (d / "stat").write_text(f"{pid} ({comm}) {state} {ppid} 1 1 0\n")
+    waited: list[int] = []
+    monkeypatch.setattr(sess.os, "waitpid", lambda pid, o: waited.append(pid) or (pid, 0))
+    sess._collect_chrome_zombies(str(tmp_path))
+    assert sorted(waited) == [11, 15]
+
+
+def test_collect_zombies_ignores_missing_proc_and_non_children(tmp_path, monkeypatch):
+    sess._collect_chrome_zombies(str(tmp_path / "none"))
+    d = tmp_path / "11"
+    d.mkdir()
+    (d / "stat").write_text(f"11 (chrome) Z {os.getpid()} 1\n")
+
+    def gone(pid, o):
+        raise ChildProcessError
+
+    monkeypatch.setattr(sess.os, "waitpid", gone)
+    sess._collect_chrome_zombies(str(tmp_path))  # 例外を出さない

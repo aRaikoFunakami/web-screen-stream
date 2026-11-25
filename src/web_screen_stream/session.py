@@ -374,6 +374,36 @@ def _pid_alive(pid: int) -> bool:
 async def _reap_tagged(tag: str) -> None:
     """目印 `tag` を持つプロセスを、刈り取りの時点で探して刈り取る（起動時に PID を覚えない = PID の再利用に強い）."""
     await _reap_chrome_pids(await asyncio.to_thread(_tagged_pids, tag))  # /proc の走査でループを止めない
+    await asyncio.to_thread(_collect_chrome_zombies)
+
+
+def _collect_chrome_zombies(proc: str = "/proc") -> None:
+    """自分の子になった終了済みの chrome 系プロセス（zombie）を回収する.
+
+    PID 1 が本プロセスのとき、reparent された crashpad 等が自力で先に終了すると zombie で残る。
+    zombie は environ が空で目印では見つからないので、状態 Z・親が自分・名前が chrome* で探す。
+    どの Manager の分でも、終了済みの chrome を回収するだけなので害はない。
+    """
+    try:
+        entries = os.listdir(proc)
+    except FileNotFoundError:
+        return
+    me = os.getpid()
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"{proc}/{entry}/stat") as f:
+                stat = f.read()
+            state, ppid = stat.rpartition(")")[2].split()[:2]
+            comm = stat[stat.index("(") + 1 : stat.rindex(")")]
+        except (OSError, ValueError):
+            continue
+        if state == "Z" and int(ppid) == me and comm.startswith("chrome"):
+            try:
+                os.waitpid(int(entry), os.WNOHANG)
+            except ChildProcessError:
+                pass
 
 
 async def _reap_chrome_pids(pids: set[int]) -> None:
