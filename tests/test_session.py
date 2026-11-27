@@ -471,6 +471,42 @@ async def test_launch_passes_proxy_only_when_set(monkeypatch):
     assert webrtc not in calls[0]["args"] and webrtc in calls[1]["args"]
 
 
+async def test_launch_passes_user_agent_only_when_set(monkeypatch):
+    """user_agent は new_page に渡す（ポップアップも同じ context なので同じ値になる）。未指定なら引数を足さない。"""
+    import playwright.async_api as pa
+
+    from web_screen_stream.config import StreamConfig
+
+    pages = []
+
+    class _Page:
+        async def goto(self, *a, **k):
+            return None
+
+    class _Browser:
+        async def new_page(self, **k):
+            pages.append(k)
+            return _Page()
+
+    class _Chromium:
+        async def launch(self, **kw):
+            return _Browser()
+
+    class _PW:
+        chromium = _Chromium()
+
+    class _Starter:
+        async def start(self):
+            return _PW()
+
+    monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
+    mgr = SessionManager()
+    await mgr._launch_browser("a", StreamConfig(), "about:blank")
+    await mgr._launch_browser("b", StreamConfig(user_agent="Mozilla/5.0 (test)"), "about:blank")
+    assert pages[0] == {"viewport": {"width": 1280, "height": 720}}
+    assert pages[1]["user_agent"] == "Mozilla/5.0 (test)"
+
+
 @pytest.mark.parametrize("proxy", [{}, {"server": ""}, {"server": 123}, "http://127.0.0.1:1",
                                    {"server": "http://127.0.0.1:1", "bypass": "*.corp"},
                                    {"server": "http://127.0.0.1:1", "pasword": "x"},
