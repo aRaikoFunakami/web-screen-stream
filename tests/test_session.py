@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from web_screen_stream.h264_extractor import H264UnitExtractor
+import web_screen_stream.session as sess
 from web_screen_stream.session import (
     BrowserStreamSession,
     SessionManager,
@@ -431,65 +432,56 @@ async def test_create_with_xvfb_keeps_config_fields(monkeypatch):
     assert launched[0].draw_mouse is True and launched[0].proxy == proxy
 
 
-async def test_launch_passes_proxy_only_when_set(monkeypatch):
-    """proxy は Playwright の launch(proxy=...) に渡す（--proxy-server を args に足すと <-loopback> が付かない）。"""
+def test_cdp_launch_args_have_no_automation_marks():
+    """普通に起動する引数: ポートは番号で渡し（0 だと navigator.webdriver が true）、--enable-automation を付けない。
+    proxy・WebRTC の制限・User-Agent は指定したときだけ。"""
+    from web_screen_stream.config import StreamConfig
+
+    plain = sess._cdp_launch_args("chrome", StreamConfig(), None, 9555, "/p")
+    assert "--remote-debugging-port=9555" in plain and "--user-data-dir=/p" in plain
+    assert not any(a.startswith(("--enable-automation", "--proxy", "--user-agent")) for a in plain)
+    assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" not in plain
+
+    c = StreamConfig(user_agent="Mozilla/5.0 (test)")
+    full = sess._cdp_launch_args("chrome", c, {"server": "http://127.0.0.1:1"}, 9555, "/p")
+    assert "--proxy-server=http://127.0.0.1:1" in full and "--proxy-bypass-list=<-loopback>" in full
+    assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in full
+    assert "--user-agent=Mozilla/5.0 (test)" in full
+    assert "--disable-popup-blocking" in plain
+    # server は「スキーム://ホスト:ポート」に組み直す（末尾の / を Chromium に渡さない）
+    slash = sess._cdp_launch_args("chrome", StreamConfig(), {"server": "http://127.0.0.1:1/"}, 9555, "/p")
+    assert "--proxy-server=http://127.0.0.1:1" in slash
+
+
+async def test_launch_uses_cdp_unless_proxy_has_credentials(monkeypatch):
+    """認証なし（無しも含む）は普通に起動して CDP で接続する。認証付きの proxy だけは Playwright の launch に渡す
+    （--proxy-server に認証は書けない）。launch のときの User-Agent は new_page に渡す。"""
     import playwright.async_api as pa
 
     from web_screen_stream.config import StreamConfig
 
-    calls = []
+    cdp_calls, launches, pages = [], [], []
 
     class _Page:
         async def goto(self, *a, **k):
             return None
 
-    class _Browser:
-        async def new_page(self, **k):
-            return _Page()
+        async def set_viewport_size(self, size):
+            pages.append({"viewport": size})
 
-    class _Chromium:
-        async def launch(self, **kw):
-            calls.append(kw)
-            return _Browser()
-
-    class _PW:
-        chromium = _Chromium()
-
-    class _Starter:
-        async def start(self):
-            return _PW()
-
-    monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
-    mgr = SessionManager()
-    await mgr._launch_browser("a", StreamConfig(), "about:blank")
-    await mgr._launch_browser("b", StreamConfig(proxy={"server": "http://127.0.0.1:1"}), "about:blank")
-    assert "proxy" not in calls[0]
-    assert calls[1]["proxy"] == {"server": "http://127.0.0.1:1"}
-    assert not any(a.startswith("--proxy") for a in calls[1]["args"])
-    # WebRTC の UDP もプロキシの外へ出さない（proxy を通すときだけ）
-    webrtc = "--webrtc-ip-handling-policy=disable_non_proxied_udp"
-    assert webrtc not in calls[0]["args"] and webrtc in calls[1]["args"]
-
-
-async def test_launch_passes_user_agent_only_when_set(monkeypatch):
-    """user_agent は new_page に渡す（ポップアップも同じ context なので同じ値になる）。未指定なら引数を足さない。"""
-    import playwright.async_api as pa
-
-    from web_screen_stream.config import StreamConfig
-
-    pages = []
-
-    class _Page:
-        async def goto(self, *a, **k):
-            return None
+    class _Context:
+        pages = [_Page()]
 
     class _Browser:
+        contexts = [_Context()]
+
         async def new_page(self, **k):
             pages.append(k)
             return _Page()
 
     class _Chromium:
         async def launch(self, **kw):
+            launches.append(kw)
             return _Browser()
 
     class _PW:
@@ -499,12 +491,25 @@ async def test_launch_passes_user_agent_only_when_set(monkeypatch):
         async def start(self):
             return _PW()
 
+    async def fake_cdp(pw, config, tag, proxy):
+        cdp_calls.append(proxy)
+        return _Browser()
+
     monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
+    monkeypatch.setattr(sess, "_launch_over_cdp", fake_cdp)
     mgr = SessionManager()
     await mgr._launch_browser("a", StreamConfig(), "about:blank")
-    await mgr._launch_browser("b", StreamConfig(user_agent="Mozilla/5.0 (test)"), "about:blank")
-    assert pages[0] == {"viewport": {"width": 1280, "height": 720}}
-    assert pages[1]["user_agent"] == "Mozilla/5.0 (test)"
+    await mgr._launch_browser("b", StreamConfig(proxy={"server": "http://127.0.0.1:1"}), "about:blank")
+    empty = {"server": "http://127.0.0.1:1", "username": "", "password": ""}  # 空の認証は認証なしと同じ
+    await mgr._launch_browser("d", StreamConfig(proxy=empty), "about:blank")
+    auth = {"server": "http://127.0.0.1:1", "username": "u", "password": "p"}
+    await mgr._launch_browser("c", StreamConfig(proxy=auth, user_agent="Mozilla/5.0 (test)"), "about:blank")
+
+    assert cdp_calls == [None, {"server": "http://127.0.0.1:1"}, empty]
+    assert pages[:3] == [{"viewport": {"width": 1280, "height": 720}}] * 3
+    assert len(launches) == 1 and launches[0]["proxy"] == auth
+    assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in launches[0]["args"]
+    assert pages[3]["user_agent"] == "Mozilla/5.0 (test)"
 
 
 @pytest.mark.parametrize("proxy", [{}, {"server": ""}, {"server": 123}, "http://127.0.0.1:1",

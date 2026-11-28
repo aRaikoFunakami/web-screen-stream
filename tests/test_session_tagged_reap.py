@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
+import sys
 import signal
 import subprocess
 
@@ -118,28 +120,23 @@ def _is_zombie(pid: int) -> bool:
 # ---------- 起動が目印を渡す ----------
 
 
-async def test_each_launch_passes_a_unique_tag_and_keeps_the_environment(monkeypatch):
-    seen: list[dict] = []
+async def test_each_launch_passes_a_unique_tag(monkeypatch):
+    tags: list[str] = []
 
     class _Page:
         async def goto(self, *a, **k):
             return None
 
-    class _Browser:
-        async def new_page(self, **k):
-            return _Page()
-
-        async def close(self):
+        async def set_viewport_size(self, size):
             return None
 
-    class _Chromium:
-        async def launch(self, **kw):
-            seen.append(kw["env"])
-            return _Browser()
+    class _Context:
+        pages = [_Page()]
+
+    class _Browser:
+        contexts = [_Context()]
 
     class _PW:
-        chromium = _Chromium()
-
         async def stop(self):
             return None
 
@@ -147,19 +144,45 @@ async def test_each_launch_passes_a_unique_tag_and_keeps_the_environment(monkeyp
         async def start(self):
             return _PW()
 
-    monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
-    monkeypatch.setenv("WSS_TEST_MARKER", "kept")
-    mgr = SessionManager()
-    tags = []
-    for _ in range(2):
-        *_, tag = await mgr._launch_browser("s", StreamConfig(), "about:blank")
+    async def fake_cdp(pw, config, tag, proxy):
         tags.append(tag)
+        return _Browser()
 
-    assert tags[0] != tags[1] and all(tags)
-    assert [e[TAG_ENV] for e in seen] == tags
-    assert all(e["WSS_TEST_MARKER"] == "kept" for e in seen)  # 環境を置き換えない
+    monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
+    monkeypatch.setattr(sess, "_launch_over_cdp", fake_cdp)
+    mgr = SessionManager()
+    returned = [(await mgr._launch_browser("s", StreamConfig(), "about:blank"))[3] for _ in range(2)]
+
+    assert returned == tags and tags[0] != tags[1] and all(tags)
+
+
+async def test_cdp_launch_passes_the_tag_and_keeps_the_environment(monkeypatch, tmp_path):
+    """普通に起動する Chromium にも目印を環境変数で渡す（環境は置き換えない）。起動直後に終了したら失敗にする。"""
+    seen: list[dict] = []
+
+    class _Proc:
+        returncode = 1
+
+    async def fake_exec(*args, env=None, **kw):
+        seen.append(env)
+        return _Proc()
+
+    class _Chromium:
+        executable_path = "chrome"
+
+    class _PW:
+        chromium = _Chromium()
+
+    monkeypatch.setattr(sess.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(sess, "_LAUNCHED", {})  # 偽の proc を他のテストに残さない
+    monkeypatch.setenv("WSS_TEST_MARKER", "kept")
+    with pytest.raises(RuntimeError, match="開かずに終了"):
+        await sess._launch_over_cdp(_PW(), StreamConfig(), "tag-1", None)
+
+    assert seen[0][TAG_ENV] == "tag-1" and seen[0]["WSS_TEST_MARKER"] == "kept"
     assert TAG_ENV not in os.environ  # 自分の環境には付けない
-
+    assert (tmp_path / "wss-chromium-tag-1").is_dir()  # プロファイルは目印から決まり、刈り取りで消す
 
 
 # ---------- 自力で先に終了して zombie になった子 ----------
@@ -182,6 +205,11 @@ def test_exited_chrome_children_of_ours_are_collected(tmp_path, monkeypatch):
     sess._collect_chrome_zombies(str(tmp_path))
     assert sorted(waited) == [11, 15]
 
+    # 普通に起動した本体（別のセッションの分も）は asyncio が回収するので、ここでは取らない
+    waited.clear()
+    sess._collect_chrome_zombies(str(tmp_path), frozenset({15}))
+    assert waited == [11]
+
 
 def test_collect_zombies_ignores_missing_proc_and_non_children(tmp_path, monkeypatch):
     sess._collect_chrome_zombies(str(tmp_path / "none"))
@@ -194,3 +222,106 @@ def test_collect_zombies_ignores_missing_proc_and_non_children(tmp_path, monkeyp
 
     monkeypatch.setattr(sess.os, "waitpid", gone)
     sess._collect_chrome_zombies(str(tmp_path))  # 例外を出さない
+
+
+async def test_reap_removes_the_profile_of_the_tag(monkeypatch, tmp_path):
+    """普通に起動した分のプロファイル（Cookie を含む）は、刈り取りで消す。"""
+    monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(sess, "_tagged_pids", lambda tag: set())
+    profile = tmp_path / "wss-chromium-t"
+    (profile / "Default").mkdir(parents=True)
+    await sess._reap_tagged("t")
+    assert not profile.exists()
+
+
+async def test_connects_to_the_url_its_own_chromium_printed(monkeypatch, tmp_path):
+    """ポートの番号ではなく、自分が起動した Chromium が標準エラーに出した接続先に繋ぐ（他人のブラウザに繋がらない）。"""
+    class _Proc:
+        returncode = None
+
+    async def fake_exec(*args, stderr=None, **kw):  # Chromium は標準エラー（ログのファイル）に接続先を書く
+        stderr.write(b"[123:ERROR] something\nDevTools listening on ws://127.0.0.1:9555/devtools/browser/abc-123\n")
+        stderr.flush()
+        return _Proc()
+
+    connected = []
+
+    class _Chromium:
+        executable_path = "chrome"
+
+        async def connect_over_cdp(self, url):
+            connected.append(url)
+            return "browser"
+
+    class _PW:
+        chromium = _Chromium()
+
+    monkeypatch.setattr(sess.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(sess, "_LAUNCHED", {})
+    assert await sess._launch_over_cdp(_PW(), StreamConfig(), "tag-2", None) == "browser"
+    assert connected == ["ws://127.0.0.1:9555/devtools/browser/abc-123"]
+
+
+async def test_reap_kills_and_collects_its_own_chromium(monkeypatch, tmp_path):
+    """/proc の無い環境でも、普通に起動した本体は刈り取りで止めて回収する。"""
+    monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(sess, "_CHROME_REAP_SIGTERM_WAIT", 0.05)
+    proc = await asyncio.create_subprocess_exec("sleep", "60")
+    monkeypatch.setitem(sess._LAUNCHED, "t-kill", proc)
+    await sess._reap_tagged("t-kill")
+    assert proc.returncode is not None and "t-kill" not in sess._LAUNCHED
+
+
+async def test_profile_is_removed_even_if_reaping_fails(monkeypatch, tmp_path):
+    """刈り取りの途中で失敗しても、Cookie を含むプロファイルは消す。"""
+    monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    def boom(tag):
+        raise RuntimeError("scan failed")
+
+    monkeypatch.setattr(sess, "_tagged_pids", boom)
+    profile = tmp_path / "wss-chromium-f"
+    profile.mkdir()
+    with pytest.raises(RuntimeError):
+        await sess._reap_tagged("f")
+    assert not profile.exists()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG は Linux だけ")
+def test_launched_chromium_dies_with_its_parent(tmp_path):
+    """本プロセスが落ちたら、普通に起動した Chromium も止まる（親の終了で SIGKILL を受ける）。"""
+    pidfile = tmp_path / "pid"
+    code = (
+        "import subprocess, sys, web_screen_stream.session as s\n"
+        f"p = subprocess.Popen(['sleep', '60'], preexec_fn=s._die_with_parent)\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)  # 親は子を残して終了する
+    pid = int(pidfile.read_text())
+    for _ in range(50):
+        if not sess._pid_alive(pid) or _is_zombie(pid):
+            break
+        time.sleep(0.1)
+    assert not sess._pid_alive(pid) or _is_zombie(pid)
+
+
+async def test_stop_launched_tolerates_a_process_that_exits_at_the_deadline(monkeypatch):
+    """期限の直後に自分で終了して kill が ProcessLookupError になっても、回収して登録を外す。"""
+    monkeypatch.setattr(sess, "_CHROME_REAP_SIGTERM_WAIT", 0.01)
+
+    class _Proc:
+        returncode = None
+
+        async def wait(self):
+            if self.returncode is None:
+                await asyncio.sleep(1)
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+            raise ProcessLookupError
+
+    monkeypatch.setattr(sess, "_LAUNCHED", {"t": _Proc()})
+    await sess._stop_launched("t")
+    assert sess._LAUNCHED == {}
