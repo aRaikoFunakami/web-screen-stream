@@ -27,6 +27,7 @@ class StreamConfig:
             （Playwright は --proxy-server と --proxy-bypass-list=<-loopback> を付け、localhost もプロキシを通す）。
             "server" は必須、"bypass" は受け付けない（強制のプロキシを抜ける穴になるため。check_proxy）。設定したときは WebRTC の UDP も
             プロキシの外へ出さない（--webrtc-ip-handling-policy=disable_non_proxied_udp）
+        user_agent: 自前起動する Chromium のページ（と、そこから開くポップアップ）の User-Agent。既定は Chromium のまま
     """
 
     display: str = ":99"
@@ -39,6 +40,7 @@ class StreamConfig:
     gop_size: int = 10
     draw_mouse: bool = False
     proxy: dict[str, str] | None = field(default=None, repr=False)  # password を持ちうるので repr に出さない
+    user_agent: str | None = None
 
     def __post_init__(self) -> None:
         if self.proxy is not None:

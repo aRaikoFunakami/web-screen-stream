@@ -819,7 +819,8 @@ class SessionManager:
                 ],
             )
             page = await browser.new_page(
-                viewport={"width": config.width, "height": config.height}
+                viewport={"width": config.width, "height": config.height},
+                **({"user_agent": config.user_agent} if config.user_agent else {}),
             )
             try:
                 await page.goto(url, wait_until="domcontentloaded")
