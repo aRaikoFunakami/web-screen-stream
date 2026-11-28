@@ -53,7 +53,19 @@ def fake_playwright(monkeypatch, log: Log, *, fail_at: str | None = None, hang_a
         async def goto(self, *a, **k):
             await step("goto")
 
+        async def set_viewport_size(self, size):
+            return None
+
+    class _Context:
+        pages: list = []
+
+        async def new_page(self):
+            await step("new_page")
+            return _Page()
+
     class _Browser:
+        contexts = [_Context()]
+
         async def new_page(self, **k):
             await step("new_page")
             return _Page()
@@ -76,7 +88,12 @@ def fake_playwright(monkeypatch, log: Log, *, fail_at: str | None = None, hang_a
         async def start(self):
             return _PW()
 
+    async def launch_over_cdp(pw, config, tag, proxy):  # 普通に起動して CDP で接続する経路（proxy 無し）
+        await step("launch")
+        return _Browser()
+
     monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
+    monkeypatch.setattr(sess, "_launch_over_cdp", launch_over_cdp)
 
 
 def fake_ffmpeg(monkeypatch, log: Log, *, fail=False, hang=False):

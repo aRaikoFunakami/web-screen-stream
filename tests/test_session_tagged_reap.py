@@ -118,28 +118,23 @@ def _is_zombie(pid: int) -> bool:
 # ---------- 起動が目印を渡す ----------
 
 
-async def test_each_launch_passes_a_unique_tag_and_keeps_the_environment(monkeypatch):
-    seen: list[dict] = []
+async def test_each_launch_passes_a_unique_tag(monkeypatch):
+    tags: list[str] = []
 
     class _Page:
         async def goto(self, *a, **k):
             return None
 
-    class _Browser:
-        async def new_page(self, **k):
-            return _Page()
-
-        async def close(self):
+        async def set_viewport_size(self, size):
             return None
 
-    class _Chromium:
-        async def launch(self, **kw):
-            seen.append(kw["env"])
-            return _Browser()
+    class _Context:
+        pages = [_Page()]
+
+    class _Browser:
+        contexts = [_Context()]
 
     class _PW:
-        chromium = _Chromium()
-
         async def stop(self):
             return None
 
@@ -147,19 +142,44 @@ async def test_each_launch_passes_a_unique_tag_and_keeps_the_environment(monkeyp
         async def start(self):
             return _PW()
 
-    monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
-    monkeypatch.setenv("WSS_TEST_MARKER", "kept")
-    mgr = SessionManager()
-    tags = []
-    for _ in range(2):
-        *_, tag = await mgr._launch_browser("s", StreamConfig(), "about:blank")
+    async def fake_cdp(pw, config, tag, proxy):
         tags.append(tag)
+        return _Browser()
 
-    assert tags[0] != tags[1] and all(tags)
-    assert [e[TAG_ENV] for e in seen] == tags
-    assert all(e["WSS_TEST_MARKER"] == "kept" for e in seen)  # 環境を置き換えない
+    monkeypatch.setattr(pa, "async_playwright", lambda: _Starter())
+    monkeypatch.setattr(sess, "_launch_over_cdp", fake_cdp)
+    mgr = SessionManager()
+    returned = [(await mgr._launch_browser("s", StreamConfig(), "about:blank"))[3] for _ in range(2)]
+
+    assert returned == tags and tags[0] != tags[1] and all(tags)
+
+
+async def test_cdp_launch_passes_the_tag_and_keeps_the_environment(monkeypatch, tmp_path):
+    """普通に起動する Chromium にも目印を環境変数で渡す（環境は置き換えない）。起動直後に終了したら失敗にする。"""
+    seen: list[dict] = []
+
+    class _Proc:
+        returncode = 1
+
+    async def fake_exec(*args, env=None, **kw):
+        seen.append(env)
+        return _Proc()
+
+    class _Chromium:
+        executable_path = "chrome"
+
+    class _PW:
+        chromium = _Chromium()
+
+    monkeypatch.setattr(sess.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv("WSS_TEST_MARKER", "kept")
+    with pytest.raises(RuntimeError, match="起動直後に終了"):
+        await sess._launch_over_cdp(_PW(), StreamConfig(), "tag-1", None)
+
+    assert seen[0][TAG_ENV] == "tag-1" and seen[0]["WSS_TEST_MARKER"] == "kept"
     assert TAG_ENV not in os.environ  # 自分の環境には付けない
-
+    assert (tmp_path / "wss-chromium-tag-1").is_dir()  # プロファイルは目印から決まり、刈り取りで消す
 
 
 # ---------- 自力で先に終了して zombie になった子 ----------
@@ -194,3 +214,13 @@ def test_collect_zombies_ignores_missing_proc_and_non_children(tmp_path, monkeyp
 
     monkeypatch.setattr(sess.os, "waitpid", gone)
     sess._collect_chrome_zombies(str(tmp_path))  # 例外を出さない
+
+
+async def test_reap_removes_the_profile_of_the_tag(monkeypatch, tmp_path):
+    """普通に起動した分のプロファイル（Cookie を含む）は、刈り取りで消す。"""
+    monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(sess, "_tagged_pids", lambda tag: set())
+    profile = tmp_path / "wss-chromium-t"
+    (profile / "Default").mkdir(parents=True)
+    await sess._reap_tagged("t")
+    assert not profile.exists()

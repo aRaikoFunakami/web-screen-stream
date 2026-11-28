@@ -13,7 +13,10 @@ import dataclasses
 import json
 import logging
 import os
+import shutil
 import signal
+import socket
+import tempfile
 import threading
 import time
 import uuid
@@ -375,6 +378,7 @@ async def _reap_tagged(tag: str) -> None:
     """目印 `tag` を持つプロセスを、刈り取りの時点で探して刈り取る（起動時に PID を覚えない = PID の再利用に強い）."""
     await _reap_chrome_pids(await asyncio.to_thread(_tagged_pids, tag))  # /proc の走査でループを止めない
     await asyncio.to_thread(_collect_chrome_zombies)
+    await asyncio.to_thread(shutil.rmtree, _profile_dir(tag), True)  # 普通に起動した分のプロファイル（Cookie を含む）
 
 
 def _collect_chrome_zombies(proc: str = "/proc") -> None:
@@ -457,6 +461,93 @@ async def _reap_chrome_pids(pids: set[int]) -> None:
         if not survivors:
             break
         await asyncio.sleep(0.1)
+
+
+_CDP_READY_TIMEOUT = 15.0  # 普通に起動した Chromium が CDP のポートを開くまでの上限（秒）
+
+
+def _profile_dir(browser_tag: str) -> str:
+    """普通に起動する Chromium の、起動ごとのプロファイル（目印から決まるので、片付けで消せる）."""
+    return os.path.join(tempfile.gettempdir(), f"wss-chromium-{browser_tag}")
+
+
+def _chromium_args(config: StreamConfig, proxy: dict[str, str] | None) -> list[str]:
+    return [
+        f"--display={config.display}",
+        "--no-sandbox",
+        "--disable-gpu",
+        f"--window-size={config.width},{config.height}",
+        "--window-position=0,0",
+        # proxy を通すときは、WebRTC の UDP（STUN・ICE）もプロキシの外へ直接出さない。
+        # --force-webrtc-ip-handling-policy は効かない（実 Chromium で ICE の候補を集めて確かめた）
+        *(["--webrtc-ip-handling-policy=disable_non_proxied_udp"] if proxy else []),
+    ]
+
+
+def _cdp_launch_args(executable: str, config: StreamConfig, proxy: dict[str, str] | None, port: int, profile: str) -> list[str]:
+    """普通に起動する Chromium の引数. Playwright の launch と違い、--enable-automation などの自動操作の印を付けない."""
+    return [
+        executable,
+        # 番号で渡す。0（Chromium に選ばせる）だと navigator.webdriver が true になる（Chrome 158・Chromium 156 で実測）
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        *_chromium_args(config, proxy),
+        # Playwright の launch(proxy=...) と同じく、localhost もプロキシを通す（<-loopback>）
+        *([f"--proxy-server={proxy['server']}", "--proxy-bypass-list=<-loopback>"] if proxy else []),
+        *([f"--user-agent={config.user_agent}"] if config.user_agent else []),
+        "about:blank",
+    ]
+
+
+async def _launch_over_cdp(pw: Any, config: StreamConfig, browser_tag: str, proxy: dict[str, str] | None) -> Any:
+    """Playwright の Chromium を普通に起動し、CDP で接続した Browser を返す.
+
+    proxy は認証なし（server だけ）に限る。起動から接続までに失敗・取り消しされたら、起動したプロセスを止める。
+    接続した後のプロセスの終了は、片付けの _close_browser と目印の刈り取り（_reap_tagged）が行う。
+    """
+    profile = _profile_dir(browser_tag)
+    os.makedirs(profile, mode=0o700)
+    # ponytail: 選んでから Chromium が listen するまでに他が取ると、接続の待ちが期限切れになる。起き始めたら再試行を足す
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    proc = await asyncio.create_subprocess_exec(
+        *_cdp_launch_args(pw.chromium.executable_path, config, proxy, port, profile),
+        env={**os.environ, _BROWSER_TAG_ENV: browser_tag},  # 指定すると既定の環境を置き換えるので、足して渡す
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + _CDP_READY_TIMEOUT
+        while True:  # ポートを番号で渡すと DevToolsActivePort は書かれないので、listen を接続で確かめる
+            if proc.returncode is not None:
+                raise RuntimeError(f"Chromium が起動直後に終了しました（終了コード {proc.returncode}）")
+            try:
+                _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.close()
+                break
+            except OSError:
+                pass
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"Chromium が {_CDP_READY_TIMEOUT} 秒以内に CDP のポートを開きませんでした")
+            await asyncio.sleep(0.1)
+        return await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+        raise
+
+
+async def _close_browser(browser: Any) -> None:
+    """ブラウザを終了する. CDP で接続しただけのブラウザは browser.close() では終了しないので、先に Browser.close を送る."""
+    try:
+        cdp = await browser.new_browser_cdp_session()
+        await cdp.send("Browser.close")
+    except Exception:  # launch したブラウザ・既に終了したブラウザ。下の close と刈り取りに任せる
+        logger.debug("Browser.close failed", exc_info=True)
+    await browser.close()
 
 
 # 片付けの各段の期限（秒）。各段の内部の期限より長くする
@@ -625,7 +716,7 @@ class SessionManager:
         if browser_info:
             pw, browser, _page = browser_info
             if browser is not None:
-                steps.append(("browser.close", browser.close, _T_CLOSE))
+                steps.append(("browser.close", lambda: _close_browser(browser), _T_CLOSE))
             steps.append(("pw.stop", pw.stop, _T_CLOSE))
         if browser_tag:  # crashpad handler 等、CDP close に反応せず生き残るプロセスを刈り取る
             steps.append(("reap", lambda: _reap_tagged(browser_tag), _T_REAP))
@@ -780,8 +871,10 @@ class SessionManager:
     async def _launch_browser(
         self, session_id: str, config: StreamConfig, url: str
     ) -> tuple[Any, Any, Any, str]:
-        """Playwright Chromium を起動してページを開く.
+        """Playwright の Chromium を起動してページを開く.
 
+        人が操作するブラウザなので、普通に起動して CDP で接続する（`_launch_over_cdp`）。
+        認証付きの proxy のときだけ Playwright の launch を使う（自動操作に見える）。
         起動ごとに一意な目印を環境変数で渡し、browser.close() では終了しない
         crashpad handler 等を、後で自分の分だけ刈り取れるようにする
         （`_tagged_pids` / `_reap_chrome_pids` 参照）。
@@ -803,25 +896,26 @@ class SessionManager:
         pw = browser = None
         try:
             pw = await async_playwright().start()
-            browser = await pw.chromium.launch(
-                headless=False,
-                env={**os.environ, _BROWSER_TAG_ENV: browser_tag},  # 指定すると既定の環境を置き換えるので、足して渡す
-                **({"proxy": proxy} if proxy else {}),
-                args=[
-                    f"--display={config.display}",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    f"--window-size={config.width},{config.height}",
-                    "--window-position=0,0",
-                    # proxy を通すときは、WebRTC の UDP（STUN・ICE）もプロキシの外へ直接出さない。
-                    # --force-webrtc-ip-handling-policy は効かない（実 Chromium で ICE の候補を集めて確かめた）
-                    *(["--webrtc-ip-handling-policy=disable_non_proxied_udp"] if proxy else []),
-                ],
-            )
-            page = await browser.new_page(
-                viewport={"width": config.width, "height": config.height},
-                **({"user_agent": config.user_agent} if config.user_agent else {}),
-            )
+            if proxy is None or not ({"username", "password"} & set(proxy)):
+                # 人が操作するブラウザなので、Playwright の launch は使わない。launch は --enable-automation などを付け、
+                # サイトから自動操作に見える（navigator.webdriver が true。TVer のログインが reCAPTCHA で拒まれた）。
+                # 普通に起動して CDP で接続する。
+                browser = await _launch_over_cdp(pw, config, browser_tag, proxy)
+                context = browser.contexts[0]
+                page = context.pages[0] if context.pages else await context.new_page()
+                await page.set_viewport_size({"width": config.width, "height": config.height})
+            else:
+                # ponytail: 認証付きの proxy は Playwright でしか渡せないので launch のまま（自動操作に見える）
+                browser = await pw.chromium.launch(
+                    headless=False,
+                    env={**os.environ, _BROWSER_TAG_ENV: browser_tag},  # 指定すると既定の環境を置き換えるので、足して渡す
+                    proxy=proxy,
+                    args=_chromium_args(config, proxy),
+                )
+                page = await browser.new_page(
+                    viewport={"width": config.width, "height": config.height},
+                    **({"user_agent": config.user_agent} if config.user_agent else {}),
+                )
             try:
                 await page.goto(url, wait_until="domcontentloaded")
             except Exception as e:
@@ -831,7 +925,7 @@ class SessionManager:
             # 起動・new_page・移動のどこで失敗・取り消されても、持っている資源を一度だけ片付ける
             steps: list[_CleanupStep] = []
             if browser is not None:
-                steps.append(("browser.close", browser.close, _T_CLOSE))
+                steps.append(("browser.close", lambda: _close_browser(browser), _T_CLOSE))
             if pw is not None:
                 steps.append(("pw.stop", pw.stop, _T_CLOSE))
                 steps.append(("reap", lambda: _reap_tagged(browser_tag), _T_REAP))
