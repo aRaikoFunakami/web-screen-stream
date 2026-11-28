@@ -8,6 +8,7 @@ crashpad のような子を引き続き刈り取れることを確認する。
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import sys
@@ -183,6 +184,9 @@ async def test_cdp_launch_passes_the_tag_and_keeps_the_environment(monkeypatch, 
     assert seen[0][TAG_ENV] == "tag-1" and seen[0]["WSS_TEST_MARKER"] == "kept"
     assert TAG_ENV not in os.environ  # 自分の環境には付けない
     assert (tmp_path / "wss-chromium-tag-1").is_dir()  # プロファイルは目印から決まり、刈り取りで消す
+    # 翻訳の案内を出さない設定を、起動前にプロファイルへ書く
+    prefs = json.loads((tmp_path / "wss-chromium-tag-1" / "Default" / "Preferences").read_text())
+    assert prefs == {"translate": {"enabled": False}}
 
 
 # ---------- 自力で先に終了して zombie になった子 ----------
