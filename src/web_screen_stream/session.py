@@ -486,6 +486,7 @@ def _chromium_args(config: StreamConfig, proxy: dict[str, str] | None) -> list[s
         f"--display={config.display}",
         "--no-sandbox",
         "--disable-gpu",
+        "--disable-dev-shm-usage",  # Playwright の launch と同じ。/dev/shm が小さいコンテナ（既定 64MB）でタブが落ちない
         f"--window-size={config.width},{config.height}",
         "--window-position=0,0",
         # proxy を通すときは、WebRTC の UDP（STUN・ICE）もプロキシの外へ直接出さない。
@@ -534,23 +535,19 @@ async def _launch_over_cdp(pw: Any, config: StreamConfig, browser_tag: str, prox
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    proc = await asyncio.create_subprocess_exec(
-        *_cdp_launch_args(pw.chromium.executable_path, config, proxy, port, profile),
-        env={**os.environ, _BROWSER_TAG_ENV: browser_tag},  # 指定すると既定の環境を置き換えるので、足して渡す
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-        preexec_fn=_die_with_parent,
-    )
-    _LAUNCHED[browser_tag] = proc  # 刈り取りで kill・回収する（/proc の無い環境でも残さない）
+    # 標準エラーはパイプにしない。crashpad などの子が引き継いで残ると、asyncio の proc.wait() が戻らなくなる
+    log_path = os.path.join(profile, "chromium.log")
+    with open(log_path, "wb") as log:
+        proc = await asyncio.create_subprocess_exec(
+            *_cdp_launch_args(pw.chromium.executable_path, config, proxy, port, profile),
+            env={**os.environ, _BROWSER_TAG_ENV: browser_tag},  # 指定すると既定の環境を置き換えるので、足して渡す
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=log,
+            preexec_fn=_die_with_parent,
+        )
+    _LAUNCHED[browser_tag] = proc  # 刈り取りで止めて回収する（/proc の無い環境でも残さない）
     try:
-        try:
-            ws_url = await asyncio.wait_for(_devtools_ws_url(proc), _CDP_READY_TIMEOUT)
-        except asyncio.TimeoutError:
-            raise RuntimeError(f"Chromium が {_CDP_READY_TIMEOUT} 秒以内に CDP のポートを開きませんでした") from None
-        # 残りの出力は読み捨てる（読まないとパイプが詰まって Chromium が止まる）。終了で EOF になり、読み終わる
-        drain = asyncio.ensure_future(_discard(proc.stderr))
-        _DRAINS.add(drain)
-        drain.add_done_callback(_DRAINS.discard)
+        ws_url = await _devtools_ws_url(proc, log_path)
         # ポートの番号ではなく、自分が起動した Chromium が出した URL（ブラウザ固有の ID 入り）に繋ぐ
         return await pw.chromium.connect_over_cdp(ws_url)
     except BaseException:
@@ -572,23 +569,22 @@ def _die_with_parent() -> None:
 # fork した子では共有ライブラリを開かない（他のスレッドが握っていたロックで止まりうる）ので、先に解決しておく
 _PRCTL = ctypes.CDLL(None, use_errno=True).prctl if sys.platform.startswith("linux") else None
 
-
 _DEVTOOLS_LINE = re.compile(rb"DevTools listening on (ws://\S+)")
 _LAUNCHED: dict[str, asyncio.subprocess.Process] = {}  # 目印 → 普通に起動した Chromium の本体
-_DRAINS: set[asyncio.Future] = set()  # 読み捨ての途中のタスク（GC で消えないように持つ）
 
 
-async def _devtools_ws_url(proc: asyncio.subprocess.Process) -> str:
-    """Chromium が待ち受けを始めたときに標準エラーへ出す接続先（ws://…/devtools/browser/<id>）を返す."""
-    while line := await proc.stderr.readline():
-        if m := _DEVTOOLS_LINE.search(line):
-            return m.group(1).decode()
-    raise RuntimeError(f"Chromium が CDP のポートを開かずに終了しました（終了コード {await proc.wait()}）")
-
-
-async def _discard(stream: asyncio.StreamReader) -> None:
-    while await stream.read(65536):
-        pass
+async def _devtools_ws_url(proc: asyncio.subprocess.Process, log_path: str) -> str:
+    """Chromium が待ち受けを始めたときに標準エラー（ログのファイル）へ出す接続先（ws://…/devtools/browser/<id>）を返す."""
+    deadline = time.monotonic() + _CDP_READY_TIMEOUT
+    while True:
+        with open(log_path, "rb") as f:
+            if m := _DEVTOOLS_LINE.search(f.read()):
+                return m.group(1).decode()
+        if proc.returncode is not None:
+            raise RuntimeError(f"Chromium が CDP のポートを開かずに終了しました（終了コード {proc.returncode}）")
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"Chromium が {_CDP_READY_TIMEOUT} 秒以内に CDP のポートを開きませんでした")
+        await asyncio.sleep(0.1)
 
 
 async def _stop_launched(tag: str) -> None:
@@ -601,8 +597,7 @@ async def _stop_launched(tag: str) -> None:
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-    finally:  # 回収が済むまでは、他のセッションの zombie の回収から外しておく
-        _LAUNCHED.pop(tag, None)
+    _LAUNCHED.pop(tag, None)  # 回収が済むまでは、他のセッションの zombie の回収から外しておく
 
 
 async def _close_browser(browser: Any) -> None:

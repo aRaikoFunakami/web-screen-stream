@@ -160,16 +160,8 @@ async def test_cdp_launch_passes_the_tag_and_keeps_the_environment(monkeypatch, 
     """普通に起動する Chromium にも目印を環境変数で渡す（環境は置き換えない）。起動直後に終了したら失敗にする。"""
     seen: list[dict] = []
 
-    class _Stderr:
-        async def readline(self):
-            return b""
-
     class _Proc:
         returncode = 1
-        stderr = _Stderr()
-
-        async def wait(self):
-            return 1
 
     async def fake_exec(*args, env=None, **kw):
         seen.append(env)
@@ -244,20 +236,12 @@ async def test_reap_removes_the_profile_of_the_tag(monkeypatch, tmp_path):
 
 async def test_connects_to_the_url_its_own_chromium_printed(monkeypatch, tmp_path):
     """ポートの番号ではなく、自分が起動した Chromium が標準エラーに出した接続先に繋ぐ（他人のブラウザに繋がらない）。"""
-    lines = [b"[123:ERROR] something\n", b"DevTools listening on ws://127.0.0.1:9555/devtools/browser/abc-123\n"]
-
-    class _Stderr:
-        async def readline(self):
-            return lines.pop(0) if lines else b""
-
-        async def read(self, n):
-            return b""
-
     class _Proc:
         returncode = None
-        stderr = _Stderr()
 
-    async def fake_exec(*args, **kw):
+    async def fake_exec(*args, stderr=None, **kw):  # Chromium は標準エラー（ログのファイル）に接続先を書く
+        stderr.write(b"[123:ERROR] something\nDevTools listening on ws://127.0.0.1:9555/devtools/browser/abc-123\n")
+        stderr.flush()
         return _Proc()
 
     connected = []
