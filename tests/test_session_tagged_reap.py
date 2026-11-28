@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
+import sys
 import signal
 import subprocess
 
@@ -212,12 +214,8 @@ def test_exited_chrome_children_of_ours_are_collected(tmp_path, monkeypatch):
     assert sorted(waited) == [11, 15]
 
     # 普通に起動した本体（別のセッションの分も）は asyncio が回収するので、ここでは取らない
-    class _Proc:
-        pid = 15
-
-    monkeypatch.setitem(sess._LAUNCHED, "other-session", _Proc())
     waited.clear()
-    sess._collect_chrome_zombies(str(tmp_path))
+    sess._collect_chrome_zombies(str(tmp_path), frozenset({15}))
     assert waited == [11]
 
 
@@ -289,3 +287,36 @@ async def test_reap_kills_and_collects_its_own_chromium(monkeypatch, tmp_path):
     sess._LAUNCHED["t-kill"] = proc
     await sess._reap_tagged("t-kill")
     assert proc.returncode is not None and "t-kill" not in sess._LAUNCHED
+
+
+async def test_profile_is_removed_even_if_reaping_fails(monkeypatch, tmp_path):
+    """刈り取りの途中で失敗しても、Cookie を含むプロファイルは消す。"""
+    monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    def boom(tag):
+        raise RuntimeError("scan failed")
+
+    monkeypatch.setattr(sess, "_tagged_pids", boom)
+    profile = tmp_path / "wss-chromium-f"
+    profile.mkdir()
+    with pytest.raises(RuntimeError):
+        await sess._reap_tagged("f")
+    assert not profile.exists()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG は Linux だけ")
+def test_launched_chromium_dies_with_its_parent(tmp_path):
+    """本プロセスが落ちたら、普通に起動した Chromium も止まる（親の終了で SIGKILL を受ける）。"""
+    pidfile = tmp_path / "pid"
+    code = (
+        "import subprocess, sys, web_screen_stream.session as s\n"
+        f"p = subprocess.Popen(['sleep', '60'], preexec_fn=s._die_with_parent)\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)  # 親は子を残して終了する
+    pid = int(pidfile.read_text())
+    for _ in range(50):
+        if not sess._pid_alive(pid) or _is_zombie(pid):
+            break
+        time.sleep(0.1)
+    assert not sess._pid_alive(pid) or _is_zombie(pid)

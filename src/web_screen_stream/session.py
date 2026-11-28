@@ -9,6 +9,7 @@ android-screen-stream の StreamSession/StreamManager と同設計。
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import dataclasses
 import json
 import logging
@@ -16,6 +17,7 @@ import os
 import re
 import shutil
 import signal
+import sys
 import socket
 import tempfile
 import threading
@@ -378,13 +380,18 @@ def _pid_alive(pid: int) -> bool:
 
 async def _reap_tagged(tag: str) -> None:
     """目印 `tag` を持つプロセスを、刈り取りの時点で探して刈り取る（起動時に PID を覚えない = PID の再利用に強い）."""
-    await _stop_launched(tag)  # 先に自分の子を回収する（waitpid を _reap_chrome_pids と取り合わない）
-    await _reap_chrome_pids(await asyncio.to_thread(_tagged_pids, tag))  # /proc の走査でループを止めない
-    await asyncio.to_thread(_collect_chrome_zombies)
-    await asyncio.to_thread(shutil.rmtree, _profile_dir(tag), True)  # 普通に起動した分のプロファイル（Cookie を含む）
+    try:
+        await _stop_launched(tag)  # 先に自分の子を回収する（waitpid を _reap_chrome_pids と取り合わない）
+        await _reap_chrome_pids(await asyncio.to_thread(_tagged_pids, tag))  # /proc の走査でループを止めない
+        # 普通に起動した本体は asyncio が回収する（先に取ると終了コードが壊れる）。集合はループ側で作る
+        # （_LAUNCHED は別のセッションの起動・停止で変わるので、別スレッドで回さない）
+        launched = frozenset(p.pid for p in _LAUNCHED.values())
+        await asyncio.to_thread(_collect_chrome_zombies, "/proc", launched)
+    finally:  # 途中で失敗・期限切れになっても、普通に起動した分のプロファイル（Cookie を含む）は消す
+        await asyncio.to_thread(shutil.rmtree, _profile_dir(tag), True)
 
 
-def _collect_chrome_zombies(proc: str = "/proc") -> None:
+def _collect_chrome_zombies(proc: str = "/proc", launched: frozenset[int] = frozenset()) -> None:
     """自分の子になった終了済みの chrome 系プロセス（zombie）を回収する.
 
     PID 1 が本プロセスのとき、reparent された crashpad 等が自力で先に終了すると zombie で残る。
@@ -396,7 +403,6 @@ def _collect_chrome_zombies(proc: str = "/proc") -> None:
     except FileNotFoundError:
         return
     me = os.getpid()
-    launched = {p.pid for p in _LAUNCHED.values()}  # 普通に起動した本体は asyncio が回収する（先に取ると終了コードが壊れる）
     for entry in entries:
         if not entry.isdigit():
             continue
@@ -533,6 +539,7 @@ async def _launch_over_cdp(pw: Any, config: StreamConfig, browser_tag: str, prox
         env={**os.environ, _BROWSER_TAG_ENV: browser_tag},  # 指定すると既定の環境を置き換えるので、足して渡す
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
+        preexec_fn=_die_with_parent,
     )
     _LAUNCHED[browser_tag] = proc  # 刈り取りで kill・回収する（/proc の無い環境でも残さない）
     try:
@@ -550,6 +557,20 @@ async def _launch_over_cdp(pw: Any, config: StreamConfig, browser_tag: str, prox
         if proc.returncode is None:
             proc.kill()
         raise
+
+
+def _die_with_parent() -> None:
+    """（fork した子で呼ばれる）本プロセスが落ちたら Chromium も止める. Linux だけ.
+
+    Playwright の launch では driver が Chromium を止めていた。直接の子にしたので、親が SIGKILL などで落ちると
+    認証なしの CDP ポートとログイン済みのプロファイルが残る。PR_SET_PDEATHSIG で親の終了時に SIGKILL を受ける。
+    """
+    if _PRCTL is not None:
+        _PRCTL(1, signal.SIGKILL)  # 1 = PR_SET_PDEATHSIG
+
+
+# fork した子では共有ライブラリを開かない（他のスレッドが握っていたロックで止まりうる）ので、先に解決しておく
+_PRCTL = ctypes.CDLL(None, use_errno=True).prctl if sys.platform.startswith("linux") else None
 
 
 _DEVTOOLS_LINE = re.compile(rb"DevTools listening on (ws://\S+)")
@@ -572,7 +593,7 @@ async def _discard(stream: asyncio.StreamReader) -> None:
 
 async def _stop_launched(tag: str) -> None:
     """普通に起動した Chromium の本体を止めて回収する（Browser.close で終了していれば回収だけ）."""
-    proc = _LAUNCHED.pop(tag, None)
+    proc = _LAUNCHED.get(tag)
     if proc is None:
         return
     try:
@@ -580,6 +601,8 @@ async def _stop_launched(tag: str) -> None:
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
+    finally:  # 回収が済むまでは、他のセッションの zombie の回収から外しておく
+        _LAUNCHED.pop(tag, None)
 
 
 async def _close_browser(browser: Any) -> None:
@@ -587,7 +610,7 @@ async def _close_browser(browser: Any) -> None:
     try:
         cdp = await browser.new_browser_cdp_session()
         await cdp.send("Browser.close")
-    except Exception:  # launch したブラウザ・既に終了したブラウザ。下の close と刈り取りに任せる
+    except Exception:  # 既に終了したブラウザ。下の close と刈り取りに任せる（launch したブラウザでも送るが、Playwright が後始末する）
         logger.debug("Browser.close failed", exc_info=True)
     await browser.close()
 
