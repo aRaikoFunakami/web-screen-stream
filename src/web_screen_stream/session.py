@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
@@ -395,6 +396,7 @@ def _collect_chrome_zombies(proc: str = "/proc") -> None:
     except FileNotFoundError:
         return
     me = os.getpid()
+    launched = {p.pid for p in _LAUNCHED.values()}  # 普通に起動した本体は asyncio が回収する（先に取ると終了コードが壊れる）
     for entry in entries:
         if not entry.isdigit():
             continue
@@ -405,7 +407,7 @@ def _collect_chrome_zombies(proc: str = "/proc") -> None:
             comm = stat[stat.index("(") + 1 : stat.rindex(")")]
         except (OSError, ValueError):
             continue
-        if state == "Z" and int(ppid) == me and comm.startswith("chrome"):
+        if state == "Z" and int(ppid) == me and comm.startswith("chrome") and int(entry) not in launched:
             try:
                 os.waitpid(int(entry), os.WNOHANG)
             except ChildProcessError:
@@ -486,11 +488,19 @@ def _chromium_args(config: StreamConfig, proxy: dict[str, str] | None) -> list[s
     ]
 
 
+def _proxy_origin(server: str) -> str:
+    """check_proxy が通した server を「スキーム://ホスト:ポート」に組み直す（Playwright の launch と同じ。末尾の / を残さない）."""
+    u = urlsplit(server)
+    return f"{u.scheme}://{u.netloc}"
+
+
 def _cdp_launch_args(executable: str, config: StreamConfig, proxy: dict[str, str] | None, port: int, profile: str) -> list[str]:
     """普通に起動する Chromium の引数. Playwright の launch と違い、--enable-automation などの自動操作の印を付けない."""
     return [
         executable,
-        # 番号で渡す。0（Chromium に選ばせる）だと navigator.webdriver が true になる（Chrome 158・Chromium 156 で実測）
+        # 番号で渡す。0（Chromium に選ばせる）と --remote-debugging-pipe は navigator.webdriver が true になる（実測）。
+        # このポートは 127.0.0.1 で認証なしに開く。同じホスト（コンテナ）のプロセスは CDP でブラウザを操作し Cookie を読める。
+        # Xvfb も -ac（認証なし）で開いているので、同じホストのプロセスを信頼する前提は変わらない
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile}",
         "--no-first-run",
@@ -499,7 +509,7 @@ def _cdp_launch_args(executable: str, config: StreamConfig, proxy: dict[str, str
         "--disable-popup-blocking",
         *_chromium_args(config, proxy),
         # Playwright の launch(proxy=...) と同じく、localhost もプロキシを通す（<-loopback>）
-        *([f"--proxy-server={proxy['server']}", "--proxy-bypass-list=<-loopback>"] if proxy else []),
+        *([f"--proxy-server={_proxy_origin(proxy['server'])}", "--proxy-bypass-list=<-loopback>"] if proxy else []),
         *([f"--user-agent={config.user_agent}"] if config.user_agent else []),
         "about:blank",
     ]
@@ -928,7 +938,7 @@ class SessionManager:
         pw = browser = None
         try:
             pw = await async_playwright().start()
-            if proxy is None or not ({"username", "password"} & set(proxy)):
+            if proxy is None or not (proxy.get("username") or proxy.get("password")):
                 # 人が操作するブラウザなので、Playwright の launch は使わない。launch は --enable-automation などを付け、
                 # サイトから自動操作に見える（navigator.webdriver が true。TVer のログインが reCAPTCHA で拒まれた）。
                 # 普通に起動して CDP で接続する。

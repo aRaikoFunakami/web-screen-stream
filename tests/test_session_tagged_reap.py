@@ -211,6 +211,15 @@ def test_exited_chrome_children_of_ours_are_collected(tmp_path, monkeypatch):
     sess._collect_chrome_zombies(str(tmp_path))
     assert sorted(waited) == [11, 15]
 
+    # 普通に起動した本体（別のセッションの分も）は asyncio が回収するので、ここでは取らない
+    class _Proc:
+        pid = 15
+
+    monkeypatch.setitem(sess._LAUNCHED, "other-session", _Proc())
+    waited.clear()
+    sess._collect_chrome_zombies(str(tmp_path))
+    assert waited == [11]
+
 
 def test_collect_zombies_ignores_missing_proc_and_non_children(tmp_path, monkeypatch):
     sess._collect_chrome_zombies(str(tmp_path / "none"))

@@ -447,6 +447,10 @@ def test_cdp_launch_args_have_no_automation_marks():
     assert "--proxy-server=http://127.0.0.1:1" in full and "--proxy-bypass-list=<-loopback>" in full
     assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in full
     assert "--user-agent=Mozilla/5.0 (test)" in full
+    assert "--disable-popup-blocking" in plain
+    # server は「スキーム://ホスト:ポート」に組み直す（末尾の / を Chromium に渡さない）
+    slash = sess._cdp_launch_args("chrome", StreamConfig(), {"server": "http://127.0.0.1:1/"}, 9555, "/p")
+    assert "--proxy-server=http://127.0.0.1:1" in slash
 
 
 async def test_launch_uses_cdp_unless_proxy_has_credentials(monkeypatch):
@@ -496,14 +500,16 @@ async def test_launch_uses_cdp_unless_proxy_has_credentials(monkeypatch):
     mgr = SessionManager()
     await mgr._launch_browser("a", StreamConfig(), "about:blank")
     await mgr._launch_browser("b", StreamConfig(proxy={"server": "http://127.0.0.1:1"}), "about:blank")
+    empty = {"server": "http://127.0.0.1:1", "username": "", "password": ""}  # 空の認証は認証なしと同じ
+    await mgr._launch_browser("d", StreamConfig(proxy=empty), "about:blank")
     auth = {"server": "http://127.0.0.1:1", "username": "u", "password": "p"}
     await mgr._launch_browser("c", StreamConfig(proxy=auth, user_agent="Mozilla/5.0 (test)"), "about:blank")
 
-    assert cdp_calls == [None, {"server": "http://127.0.0.1:1"}]
-    assert pages[:2] == [{"viewport": {"width": 1280, "height": 720}}] * 2
+    assert cdp_calls == [None, {"server": "http://127.0.0.1:1"}, empty]
+    assert pages[:3] == [{"viewport": {"width": 1280, "height": 720}}] * 3
     assert len(launches) == 1 and launches[0]["proxy"] == auth
     assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in launches[0]["args"]
-    assert pages[2]["user_agent"] == "Mozilla/5.0 (test)"
+    assert pages[3]["user_agent"] == "Mozilla/5.0 (test)"
 
 
 @pytest.mark.parametrize("proxy", [{}, {"server": ""}, {"server": 123}, "http://127.0.0.1:1",
