@@ -448,6 +448,8 @@ def test_cdp_launch_args_have_no_automation_marks():
     assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in full
     assert "--user-agent=Mozilla/5.0 (test)" in full
     assert "--disable-popup-blocking" in plain
+    # 検索エンジンの選択画面と「--no-sandbox」の警告の帯を出さない（--test-type は webdriver を true にしない）
+    assert "--disable-search-engine-choice-screen" in plain and "--test-type" in plain
     # server は「スキーム://ホスト:ポート」に組み直す（末尾の / を Chromium に渡さない）
     slash = sess._cdp_launch_args("chrome", StreamConfig(), {"server": "http://127.0.0.1:1/"}, 9555, "/p")
     assert "--proxy-server=http://127.0.0.1:1" in slash

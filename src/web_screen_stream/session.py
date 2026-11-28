@@ -513,6 +513,11 @@ def _cdp_launch_args(executable: str, config: StreamConfig, proxy: dict[str, str
         f"--user-data-dir={profile}",
         "--no-first-run",
         "--no-default-browser-check",
+        # Playwright の launch と同じく、検索エンジンの選択画面を出さない（翻訳はプロファイルの設定で止める）
+        "--disable-search-engine-choice-screen",
+        # 「--no-sandbox」の警告の帯を出さない。navigator.webdriver は false のまま（実測）。
+        # 「Chrome for Testing」の帯は消えない（消すには --enable-automation が要り、webdriver が true になる）
+        "--test-type",
         # Playwright の launch と同じく、ポップアップを止めない（SSO のボタンは非同期の処理の後に window.open することがある）
         "--disable-popup-blocking",
         *_chromium_args(config, proxy),
@@ -531,6 +536,10 @@ async def _launch_over_cdp(pw: Any, config: StreamConfig, browser_tag: str, prox
     """
     profile = _profile_dir(browser_tag)
     os.makedirs(profile, mode=0o700)
+    # 翻訳の案内を出さない。Chromium 156 は --disable-features=Translate では止まらない（実測）ので、設定（translate.enabled）で止める
+    os.makedirs(os.path.join(profile, "Default"), mode=0o700)
+    with open(os.path.join(profile, "Default", "Preferences"), "w") as f:
+        json.dump({"translate": {"enabled": False}}, f)
     # ponytail: 選んでから Chromium が listen するまでに他が取ると、Chromium は待ち受けられず期限切れで失敗する。
     # 起き始めたら再試行を足す（他人のブラウザに繋がることは無い。下の DevTools の行で繋ぐ）
     with socket.socket() as sock:

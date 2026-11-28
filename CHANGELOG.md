@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- 自前起動する Chromium で、翻訳の案内・検索エンジンの選択画面・「--no-sandbox」の警告の帯を出さないようにした。1.2.0 で Playwright の `launch` をやめたため、Playwright が付けていた既定の引数が外れていた。翻訳は Chromium 156 では `--disable-features=Translate` で止まらないので、起動前にプロファイルの設定（`translate.enabled`）で止める。警告の帯は `--test-type` で止める（`navigator.webdriver` は false のまま）。「Chrome for Testing」の帯は残る（消すには `--enable-automation` が要り、`navigator.webdriver` が true になる）
+
 ## 1.2.0 (2026-11-28)
 
 ### Added
