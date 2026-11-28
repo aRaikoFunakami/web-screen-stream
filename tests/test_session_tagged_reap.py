@@ -158,8 +158,16 @@ async def test_cdp_launch_passes_the_tag_and_keeps_the_environment(monkeypatch, 
     """普通に起動する Chromium にも目印を環境変数で渡す（環境は置き換えない）。起動直後に終了したら失敗にする。"""
     seen: list[dict] = []
 
+    class _Stderr:
+        async def readline(self):
+            return b""
+
     class _Proc:
         returncode = 1
+        stderr = _Stderr()
+
+        async def wait(self):
+            return 1
 
     async def fake_exec(*args, env=None, **kw):
         seen.append(env)
@@ -174,8 +182,9 @@ async def test_cdp_launch_passes_the_tag_and_keeps_the_environment(monkeypatch, 
     monkeypatch.setattr(sess.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setenv("WSS_TEST_MARKER", "kept")
-    with pytest.raises(RuntimeError, match="起動直後に終了"):
+    with pytest.raises(RuntimeError, match="開かずに終了"):
         await sess._launch_over_cdp(_PW(), StreamConfig(), "tag-1", None)
+    sess._LAUNCHED.pop("tag-1")
 
     assert seen[0][TAG_ENV] == "tag-1" and seen[0]["WSS_TEST_MARKER"] == "kept"
     assert TAG_ENV not in os.environ  # 自分の環境には付けない
@@ -224,3 +233,50 @@ async def test_reap_removes_the_profile_of_the_tag(monkeypatch, tmp_path):
     (profile / "Default").mkdir(parents=True)
     await sess._reap_tagged("t")
     assert not profile.exists()
+
+
+async def test_connects_to_the_url_its_own_chromium_printed(monkeypatch, tmp_path):
+    """ポートの番号ではなく、自分が起動した Chromium が標準エラーに出した接続先に繋ぐ（他人のブラウザに繋がらない）。"""
+    lines = [b"[123:ERROR] something\n", b"DevTools listening on ws://127.0.0.1:9555/devtools/browser/abc-123\n"]
+
+    class _Stderr:
+        async def readline(self):
+            return lines.pop(0) if lines else b""
+
+        async def read(self, n):
+            return b""
+
+    class _Proc:
+        returncode = None
+        stderr = _Stderr()
+
+    async def fake_exec(*args, **kw):
+        return _Proc()
+
+    connected = []
+
+    class _Chromium:
+        executable_path = "chrome"
+
+        async def connect_over_cdp(self, url):
+            connected.append(url)
+            return "browser"
+
+    class _PW:
+        chromium = _Chromium()
+
+    monkeypatch.setattr(sess.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
+    assert await sess._launch_over_cdp(_PW(), StreamConfig(), "tag-2", None) == "browser"
+    assert connected == ["ws://127.0.0.1:9555/devtools/browser/abc-123"]
+    sess._LAUNCHED.pop("tag-2")
+
+
+async def test_reap_kills_and_collects_its_own_chromium(monkeypatch, tmp_path):
+    """/proc の無い環境でも、普通に起動した本体は刈り取りで止めて回収する。"""
+    monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(sess, "_CHROME_REAP_SIGTERM_WAIT", 0.05)
+    proc = await asyncio.create_subprocess_exec("sleep", "60")
+    sess._LAUNCHED["t-kill"] = proc
+    await sess._reap_tagged("t-kill")
+    assert proc.returncode is not None and "t-kill" not in sess._LAUNCHED

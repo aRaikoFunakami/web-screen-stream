@@ -13,6 +13,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket
@@ -376,6 +377,7 @@ def _pid_alive(pid: int) -> bool:
 
 async def _reap_tagged(tag: str) -> None:
     """目印 `tag` を持つプロセスを、刈り取りの時点で探して刈り取る（起動時に PID を覚えない = PID の再利用に強い）."""
+    await _stop_launched(tag)  # 先に自分の子を回収する（waitpid を _reap_chrome_pids と取り合わない）
     await _reap_chrome_pids(await asyncio.to_thread(_tagged_pids, tag))  # /proc の走査でループを止めない
     await asyncio.to_thread(_collect_chrome_zombies)
     await asyncio.to_thread(shutil.rmtree, _profile_dir(tag), True)  # 普通に起動した分のプロファイル（Cookie を含む）
@@ -493,6 +495,8 @@ def _cdp_launch_args(executable: str, config: StreamConfig, proxy: dict[str, str
         f"--user-data-dir={profile}",
         "--no-first-run",
         "--no-default-browser-check",
+        # Playwright の launch と同じく、ポップアップを止めない（SSO のボタンは非同期の処理の後に window.open することがある）
+        "--disable-popup-blocking",
         *_chromium_args(config, proxy),
         # Playwright の launch(proxy=...) と同じく、localhost もプロキシを通す（<-loopback>）
         *([f"--proxy-server={proxy['server']}", "--proxy-bypass-list=<-loopback>"] if proxy else []),
@@ -509,7 +513,8 @@ async def _launch_over_cdp(pw: Any, config: StreamConfig, browser_tag: str, prox
     """
     profile = _profile_dir(browser_tag)
     os.makedirs(profile, mode=0o700)
-    # ponytail: 選んでから Chromium が listen するまでに他が取ると、接続の待ちが期限切れになる。起き始めたら再試行を足す
+    # ponytail: 選んでから Chromium が listen するまでに他が取ると、Chromium は待ち受けられず期限切れで失敗する。
+    # 起き始めたら再試行を足す（他人のブラウザに繋がることは無い。下の DevTools の行で繋ぐ）
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -517,27 +522,54 @@ async def _launch_over_cdp(pw: Any, config: StreamConfig, browser_tag: str, prox
         *_cdp_launch_args(pw.chromium.executable_path, config, proxy, port, profile),
         env={**os.environ, _BROWSER_TAG_ENV: browser_tag},  # 指定すると既定の環境を置き換えるので、足して渡す
         stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
+    _LAUNCHED[browser_tag] = proc  # 刈り取りで kill・回収する（/proc の無い環境でも残さない）
     try:
-        deadline = time.monotonic() + _CDP_READY_TIMEOUT
-        while True:  # ポートを番号で渡すと DevToolsActivePort は書かれないので、listen を接続で確かめる
-            if proc.returncode is not None:
-                raise RuntimeError(f"Chromium が起動直後に終了しました（終了コード {proc.returncode}）")
-            try:
-                _reader, writer = await asyncio.open_connection("127.0.0.1", port)
-                writer.close()
-                break
-            except OSError:
-                pass
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"Chromium が {_CDP_READY_TIMEOUT} 秒以内に CDP のポートを開きませんでした")
-            await asyncio.sleep(0.1)
-        return await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        try:
+            ws_url = await asyncio.wait_for(_devtools_ws_url(proc), _CDP_READY_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"Chromium が {_CDP_READY_TIMEOUT} 秒以内に CDP のポートを開きませんでした") from None
+        # 残りの出力は読み捨てる（読まないとパイプが詰まって Chromium が止まる）。終了で EOF になり、読み終わる
+        drain = asyncio.ensure_future(_discard(proc.stderr))
+        _DRAINS.add(drain)
+        drain.add_done_callback(_DRAINS.discard)
+        # ポートの番号ではなく、自分が起動した Chromium が出した URL（ブラウザ固有の ID 入り）に繋ぐ
+        return await pw.chromium.connect_over_cdp(ws_url)
     except BaseException:
         if proc.returncode is None:
             proc.kill()
         raise
+
+
+_DEVTOOLS_LINE = re.compile(rb"DevTools listening on (ws://\S+)")
+_LAUNCHED: dict[str, asyncio.subprocess.Process] = {}  # 目印 → 普通に起動した Chromium の本体
+_DRAINS: set[asyncio.Future] = set()  # 読み捨ての途中のタスク（GC で消えないように持つ）
+
+
+async def _devtools_ws_url(proc: asyncio.subprocess.Process) -> str:
+    """Chromium が待ち受けを始めたときに標準エラーへ出す接続先（ws://…/devtools/browser/<id>）を返す."""
+    while line := await proc.stderr.readline():
+        if m := _DEVTOOLS_LINE.search(line):
+            return m.group(1).decode()
+    raise RuntimeError(f"Chromium が CDP のポートを開かずに終了しました（終了コード {await proc.wait()}）")
+
+
+async def _discard(stream: asyncio.StreamReader) -> None:
+    while await stream.read(65536):
+        pass
+
+
+async def _stop_launched(tag: str) -> None:
+    """普通に起動した Chromium の本体を止めて回収する（Browser.close で終了していれば回収だけ）."""
+    proc = _LAUNCHED.pop(tag, None)
+    if proc is None:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), _CHROME_REAP_SIGTERM_WAIT)  # Browser.close の後の自然な終了を待つ
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
 
 
 async def _close_browser(browser: Any) -> None:

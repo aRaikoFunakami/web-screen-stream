@@ -78,6 +78,10 @@ async def test_launched_browser_does_not_look_automated_and_is_cleaned_up(server
         pages = [s for s in seen if s["path"] in ("/", "/popup")]  # favicon などは除く
         assert [s["ua"] for s in pages] == [_UA, _UA]  # ポップアップも同じ User-Agent
         print("Sec-CH-UA-Platform:", [s["platform"] for s in pages])
+        # ユーザー操作から時間が経った（一時的な操作の権限が切れた）後の window.open もブロックしない
+        async with page.context.expect_page(timeout=15000) as late_info:
+            await page.evaluate("setTimeout(() => window.open('/late'), 6000)")
+        await (await late_info.value).wait_for_load_state()
         assert sess._tagged_pids(tag)
     finally:
         await mgr.stop("s")
