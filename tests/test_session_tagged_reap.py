@@ -175,10 +175,10 @@ async def test_cdp_launch_passes_the_tag_and_keeps_the_environment(monkeypatch, 
 
     monkeypatch.setattr(sess.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(sess, "_LAUNCHED", {})  # 偽の proc を他のテストに残さない
     monkeypatch.setenv("WSS_TEST_MARKER", "kept")
     with pytest.raises(RuntimeError, match="開かずに終了"):
         await sess._launch_over_cdp(_PW(), StreamConfig(), "tag-1", None)
-    sess._LAUNCHED.pop("tag-1")
 
     assert seen[0][TAG_ENV] == "tag-1" and seen[0]["WSS_TEST_MARKER"] == "kept"
     assert TAG_ENV not in os.environ  # 自分の環境には付けない
@@ -258,9 +258,9 @@ async def test_connects_to_the_url_its_own_chromium_printed(monkeypatch, tmp_pat
 
     monkeypatch.setattr(sess.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(sess, "_LAUNCHED", {})
     assert await sess._launch_over_cdp(_PW(), StreamConfig(), "tag-2", None) == "browser"
     assert connected == ["ws://127.0.0.1:9555/devtools/browser/abc-123"]
-    sess._LAUNCHED.pop("tag-2")
 
 
 async def test_reap_kills_and_collects_its_own_chromium(monkeypatch, tmp_path):
@@ -268,7 +268,7 @@ async def test_reap_kills_and_collects_its_own_chromium(monkeypatch, tmp_path):
     monkeypatch.setattr(sess.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(sess, "_CHROME_REAP_SIGTERM_WAIT", 0.05)
     proc = await asyncio.create_subprocess_exec("sleep", "60")
-    sess._LAUNCHED["t-kill"] = proc
+    monkeypatch.setitem(sess._LAUNCHED, "t-kill", proc)
     await sess._reap_tagged("t-kill")
     assert proc.returncode is not None and "t-kill" not in sess._LAUNCHED
 
@@ -304,3 +304,24 @@ def test_launched_chromium_dies_with_its_parent(tmp_path):
             break
         time.sleep(0.1)
     assert not sess._pid_alive(pid) or _is_zombie(pid)
+
+
+async def test_stop_launched_tolerates_a_process_that_exits_at_the_deadline(monkeypatch):
+    """期限の直後に自分で終了して kill が ProcessLookupError になっても、回収して登録を外す。"""
+    monkeypatch.setattr(sess, "_CHROME_REAP_SIGTERM_WAIT", 0.01)
+
+    class _Proc:
+        returncode = None
+
+        async def wait(self):
+            if self.returncode is None:
+                await asyncio.sleep(1)
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+            raise ProcessLookupError
+
+    monkeypatch.setattr(sess, "_LAUNCHED", {"t": _Proc()})
+    await sess._stop_launched("t")
+    assert sess._LAUNCHED == {}

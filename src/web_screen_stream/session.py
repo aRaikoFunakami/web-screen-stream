@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import contextlib
 import dataclasses
 import json
 import logging
@@ -561,6 +562,7 @@ def _die_with_parent() -> None:
 
     Playwright の launch では driver が Chromium を止めていた。直接の子にしたので、親が SIGKILL などで落ちると
     認証なしの CDP ポートとログイン済みのプロファイルが残る。PR_SET_PDEATHSIG で親の終了時に SIGKILL を受ける。
+    PR_SET_PDEATHSIG は fork したスレッドの終了で発火するので、イベントループは長生きするスレッドで動かすこと。
     """
     if _PRCTL is not None:
         _PRCTL(1, signal.SIGKILL)  # 1 = PR_SET_PDEATHSIG
@@ -595,9 +597,12 @@ async def _stop_launched(tag: str) -> None:
     try:
         await asyncio.wait_for(proc.wait(), _CHROME_REAP_SIGTERM_WAIT)  # Browser.close の後の自然な終了を待つ
     except asyncio.TimeoutError:
-        proc.kill()
+        with contextlib.suppress(ProcessLookupError):  # 期限の直後に自分で終了した
+            proc.kill()
         await proc.wait()
-    _LAUNCHED.pop(tag, None)  # 回収が済むまでは、他のセッションの zombie の回収から外しておく
+    finally:  # 回収が済むまでは、他のセッションの zombie の回収から外しておく
+        if proc.returncode is not None:
+            _LAUNCHED.pop(tag, None)
 
 
 async def _close_browser(browser: Any) -> None:
